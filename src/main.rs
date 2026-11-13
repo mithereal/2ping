@@ -1,14 +1,19 @@
 use clap::Parser;
-use hickory_resolver::TokioAsyncResolver;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
+use tokio::sync::RwLock;
 use twoping::config::{AppConfigFile, KeyringFile};
 use twoping::crypto::{AuthDigest, EncryptMethod, SecurityConfig};
-use twoping::engine::{run_engine, EngineConfig, TargetSpec};
+use twoping::engine::{run_engine, EngineConfig};
+use twoping::mtr::run_mtr_trace;
 use twoping::protocol::DEFAULT_PORT;
+use twoping::reload::{spawn_hot_reloader, ReloadSpec, RuntimeControls};
+use twoping::resolve_targets_public;
+use twoping::webhooks::{WebhookConfig, WebhookDispatcher};
 
 #[derive(Parser, Debug)]
 #[command(name = "2ping", version, about = "Enterprise bi-directional ping utility in Rust")]
@@ -16,7 +21,7 @@ struct Cli {
     /// One or more hostnames or IP addresses of 2ping listeners
     hosts: Vec<String>,
 
-    /// Path to a TOML configuration file
+    /// Path to a TOML configuration file (hot-reloaded on change or SIGHUP)
     #[arg(long)]
     config: Option<PathBuf>,
 
@@ -36,6 +41,18 @@ struct Cli {
     #[arg(long)]
     listen: bool,
 
+    /// Run per-hop MTR path trace to target(s)
+    #[arg(long)]
+    mtr: bool,
+
+    /// Maximum TTL/hop limit for --mtr tracing
+    #[arg(long, default_value_t = 30)]
+    max_hops: u8,
+
+    /// Probe rounds per hop for --mtr tracing
+    #[arg(long, default_value_t = 3)]
+    mtr_rounds: u32,
+
     /// Resolve target hosts via _2ping._udp.<domain> DNS SRV records
     #[arg(long)]
     srv: bool,
@@ -47,6 +64,21 @@ struct Cli {
     /// Automatically slow down probe rate during high packet loss (>20%)
     #[arg(long)]
     adaptive: bool,
+
+    /// Webhook URL for loss/RTT degradation alerts (requires --features webhooks)
+    #[cfg(feature = "webhooks")]
+    #[arg(long)]
+    webhook_url: Option<String>,
+
+    /// Directional packet loss % threshold to trigger webhook alerts
+    #[cfg(feature = "webhooks")]
+    #[arg(long, default_value_t = 5.0)]
+    webhook_loss_threshold: f64,
+
+    /// Average RTT ms threshold to trigger webhook alerts
+    #[cfg(feature = "webhooks")]
+    #[arg(long)]
+    webhook_rtt_threshold: Option<f64>,
 
     /// Stop after sending count pings per target
     #[arg(short = 'c', long)]
@@ -211,69 +243,6 @@ fn bind_dual_stack_socket(
     UdpSocket::from_std(std_sock)
 }
 
-fn normalize_for_dual_stack(addr: SocketAddr) -> SocketAddr {
-    match addr {
-        SocketAddr::V4(v4) => SocketAddr::new(v4.ip().to_ipv6_mapped().into(), v4.port()),
-        SocketAddr::V6(v6) => SocketAddr::V6(v6),
-    }
-}
-
-async fn resolve_targets(
-    hosts: &[String],
-    default_port: u16,
-    use_srv: bool,
-) -> Result<Vec<TargetSpec>, Box<dyn std::error::Error>> {
-    let mut specs = Vec::new();
-    let resolver = if use_srv {
-        Some(TokioAsyncResolver::tokio_from_system_conf()?)
-    } else {
-        None
-    };
-
-    for host in hosts {
-        if let Some(ref res) = resolver {
-            let srv_query = format!("_2ping._udp.{}.", host.trim_end_matches('.'));
-            let srv_lookup = res.srv_lookup(&srv_query).await?;
-            let record = srv_lookup
-                .iter()
-                .min_by_key(|r| (r.priority(), std::cmp::Reverse(r.weight())))
-                .ok_or_else(|| format!("No SRV records found for {}", srv_query))?;
-
-            let target_host = record.target().to_utf8();
-            let addr_str = format!("{}:{}", target_host.trim_end_matches('.'), record.port());
-            let resolved = addr_str
-                .to_socket_addrs()?
-                .next()
-                .ok_or_else(|| format!("Unable to resolve SRV target {}", addr_str))?;
-
-            specs.push(TargetSpec {
-                name: format!("{} ({}:{})", host, target_host.trim_end_matches('.'), record.port()),
-                addr: normalize_for_dual_stack(resolved),
-            });
-        } else {
-            let addr_str = if host.starts_with('[') || host.matches(':').count() == 1 {
-                host.clone()
-            } else if host.contains(':') {
-                format!("[{}]:{}", host, default_port)
-            } else {
-                format!("{}:{}", host, default_port)
-            };
-
-            let resolved = addr_str
-                .to_socket_addrs()?
-                .next()
-                .ok_or_else(|| format!("Unable to resolve host '{}'", host))?;
-
-            specs.push(TargetSpec {
-                name: host.clone(),
-                addr: normalize_for_dual_stack(resolved),
-            });
-        }
-    }
-
-    Ok(specs)
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -284,7 +253,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let listen_mode = cli.listen || file_cfg.listen.unwrap_or(false);
-    let hosts = if !cli.hosts.is_empty() {
+    let cli_hosts_override = !cli.hosts.is_empty();
+    let hosts = if cli_hosts_override {
         cli.hosts.clone()
     } else {
         file_cfg.targets.unwrap_or_default()
@@ -311,48 +281,95 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let enc_method = EncryptMethod::from_str(&cli.encrypt_method)?;
     let digest = AuthDigest::from_str(&cli.auth_digest)?;
 
-    // Build SecurityConfig from --keyring, --config keys, or single CLI secrets
-    let security = if let Some(kr_path) = &cli.keyring {
+    let initial_security = if let Some(kr_path) = &cli.keyring {
         let kr = KeyringFile::load(kr_path)?;
         let active_id = cli.active_key_id.as_deref().or(kr.active_key_id.as_deref());
-
         SecurityConfig::from_keyring(&kr.keys, active_id, digest, enc_method)?
-} else if !file_cfg.keys.is_empty() {
-let active_id = cli
-.active_key_id
-.as_deref()
-.or(file_cfg.active_key_id.as_deref());
-SecurityConfig::from_keyring(&file_cfg.keys, active_id, digest, enc_method)?
-} else {
-SecurityConfig::new(
-cli.auth.as_deref(),
+    } else if !file_cfg.keys.is_empty() {
+        let active_id = cli
+            .active_key_id
+            .as_deref()
+            .or(file_cfg.active_key_id.as_deref());
+        SecurityConfig::from_keyring(&file_cfg.keys, active_id, digest, enc_method)?
+    } else {
+        SecurityConfig::new(
+            cli.auth.as_deref(),
+            digest,
+            cli.encrypt.as_deref(),
+            enc_method,
+        )
+    };
+
+    let base_min_size = cli
+        .min_packet_size
+        .or(file_cfg.min_packet_size)
+        .unwrap_or(128);
+    let min_packet_size = cli
+        .packetsize_compat
+        .map(|s| s + 8)
+        .unwrap_or(base_min_size);
+
+    let pad_pattern = match &cli.pattern {
+        Some(p) => parse_hex_pattern(p)?,
+        None => Vec::new(),
+    };
+
+    let (bind_port, initial_targets) = if listen_mode {
+        (port, Vec::new())
+    } else {
+        let resolved_targets = resolve_targets_public(&hosts, port, use_srv).await?;
+        (0, resolved_targets)
+    };
+
+    let shared_security = Arc::new(RwLock::new(initial_security));
+    let shared_targets = Arc::new(RwLock::new(initial_targets));
+// Start hot-reload watcher for SIGHUP and file changes
+spawn_hot_reloader(
+RuntimeControls {
+security: Arc::clone(&shared_security),
+targets: Arc::clone(&shared_targets),
+},
+ReloadSpec {
+config_path: cli.config.clone(),
+keyring_path: cli.keyring.clone(),
+cli_active_key_id: cli.active_key_id.clone(),
+cli_auth: cli.auth.clone(),
+cli_encrypt: cli.encrypt.clone(),
 digest,
-cli.encrypt.as_deref(),
-enc_method,
+encrypt_method: enc_method,
+default_port: port,
+use_srv,
+cli_hosts_override,
+quiet: cli.quiet,
+json_output: cli.json,
+},
+);
+if cli.mtr {
+run_mtr_trace(
+shared_targets,
+shared_security,
+cli.max_hops,
+cli.mtr_rounds,
+cli.json,
 )
+.await?;
+return Ok(());
+}
+#[cfg(feature = "webhooks")]
+let webhook_cfg = WebhookConfig {
+url: cli.webhook_url.or(file_cfg.webhook_url),
+loss_threshold_pct: file_cfg
+.webhook_loss_threshold
+.unwrap_or(cli.webhook_loss_threshold),
+rtt_threshold_ms: cli.webhook_rtt_threshold.or(file_cfg.webhook_rtt_threshold),
+cooldown: Duration::from_secs(60),
 };
-let base_min_size = cli
-.min_packet_size
-.or(file_cfg.min_packet_size)
-.unwrap_or(128);
-let min_packet_size = cli
-.packetsize_compat
-.map(|s| s + 8)
-.unwrap_or(base_min_size);
-let pad_pattern = match &cli.pattern {
-Some(p) => parse_hex_pattern(p)?,
-None => Vec::new(),
-};
-let (bind_port, targets) = if listen_mode {
-(port, Vec::new())
-} else {
-let resolved_targets = resolve_targets(&hosts, port, use_srv).await?;
-(0, resolved_targets)
-};
+#[cfg(not(feature = "webhooks"))]
+let webhook_cfg = WebhookConfig::default();
 let socket = bind_dual_stack_socket(bind_port, tos_byte, cli.mtu_discover)?;
 let config = EngineConfig {
 listen_mode,
-targets,
+targets: shared_targets,
 interval: Duration::from_secs_f64(interval_sec.max(0.01)),
 count,
 min_packet_size,
@@ -365,7 +382,8 @@ mtu_discover: cli.mtu_discover,
 tui_mode: cli.tui,
 adaptive,
 metrics_port,
-security,
+security: shared_security,
+webhook: Arc::new(WebhookDispatcher::new(webhook_cfg)),
 };
 run_engine(socket, config).await?;
 Ok(())

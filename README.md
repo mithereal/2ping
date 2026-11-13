@@ -5,21 +5,22 @@ An enterprise-grade, asynchronous Rust implementation of **2ping**, a bi-directi
 
 ---
 
-## Comparison: Original Python `2ping` vs. Rust `2ping` (`v1.0.0`)
+## Comparison: Original Python `2ping` vs. Rust `2ping` (`v1.2.0`)
 
-While remaining wire-compatible with the core `2ping` binary framing (`0x3250` magic header, 16-bit one's complement checksums, 48-bit Message IDs, and standard opcodes), this Rust rewrite delivers major improvements in timing accuracy, cryptography, multi-target scale, and observability:
+While remaining wire-compatible with the core `2ping` binary framing (`0x3250` magic header, 16-bit one's complement checksums, 48-bit Message IDs, and standard opcodes), this Rust rewrite delivers major improvements in timing accuracy, cryptography, path diagnostics, and operational automation:
 
-| Capability | Original Python `2ping` | Rust `2ping` (`v1.0.0`) |
+| Capability | Original Python `2ping` | Rust `2ping` (`v1.2.0`) |
 | :--- | :--- | :--- |
 | **Runtime & Memory** | Single-threaded Python 3 process with optional C-extensions (`pycryptodomex`, `dnspython`, `netifaces`) | Single compiled native binary powered by `tokio` async I/O with bounded `10,000`-sample ring buffers for flat 24/7 memory usage |
 | **Receive Timestamps** | User-space `time.time()` calls subject to Python GIL and event-loop jitter | Kernel nanosecond receive timestamps via `SO_TIMESTAMPNS` / `SCM_TIMESTAMPNS` (`recvmsg`) on Linux |
 | **One-Way Delay (OWD)** | RTT only | Embeds nanosecond UTC wall-clock opcodes (`TxTimestampNs` / `RxTimestampNs`) to separate **outbound transit ms** from **inbound transit ms** on NTP/PTP-synced hosts |
 | **Host Processing Delay** | Parses `HostLatency` (`0x0010`) | Measures exact listener processing delay in microseconds and subtracts it from client RTT to isolate true network transit time |
 | **Multi-Target & Dual-Stack** | Single target per invocation | Probes multiple hosts concurrently (`2ping host1 host2 ...`) over a single dual-stack `[::]` IPv4/IPv6 UDP socket |
-| **Path MTU Discovery** | Not supported | Built-in `--mtu-discover` binary search (`128..9000` bytes) with IP Don't Fragment (`DF`) enabled to pinpoint tunnel/VPN MTU ceilings |
+| **Path Diagnostics** | Basic packet loss & RTT | Built-in **per-hop MTR path tracing (`--mtr`)** and **Path MTU binary search (`--mtu-discover`, `128..9000` bytes)** |
 | **Cryptography & Key Rotation** | Single static secret with `AES-256-CBC` + `HMAC` | Defaults to **`ChaCha20-Poly1305` AEAD** (binding the 12-byte outer header as Associated Data), supports **zero-downtime multi-key rotation (`--keyring`)**, and includes a sliding-window `ReplayCache` |
-| **QoS / DiffServ Marking** | Not supported | Built-in `--dscp` flag (`EF`, `AF41`, `CS5`, or `0..63`) setting `IP_TOS` / `IPV6_TCLASS` |
-| **Observability & UI** | Plaintext stdout only | Live interactive **`--tui` terminal dashboard** (sparklines & directional gauges), **`--json` NDJSON** streaming, and a **`--metrics-port` Prometheus `/metrics`** HTTP exporter |
+| **Hot-Reloading** | Requires process restart | Watches `--config` and `--keyring` files automatically and responds to **`SIGHUP`** (`systemctl reload 2ping`) without dropping active sessions |
+| **Alerting & Observability** | Plaintext stdout only | Interactive **`--tui` terminal dashboard**, **`--json` NDJSON** streaming, **`--metrics-port` Prometheus `/metrics`**, and **optional compile-time webhook alerts (`--features webhooks`)** |
+
 
 
 ---
@@ -28,11 +29,13 @@ While remaining wire-compatible with the core `2ping` binary framing (`0x3250` m
 
 - **Directional Packet Loss & One-Way Latency:** Distinguishes outbound vs. inbound drops and separates upload vs. download transit times.
 - **Kernel-Level Precision:** Uses Linux `SO_TIMESTAMPNS` ancillary control messages and `HostLatency` subtraction to eliminate user-space scheduling jitter.
-- **Tail Latency & Jitter Metrics:** Computes `min/avg/max/mdev`, RFC 3550 smoothed jitter, and `p50/p95/p99` percentiles over a bounded sliding window.
-- **Zero-Downtime Key Rotation (`--keyring`):** Supports active and staged secrets via `KeyId` (`0x0080`) with `ChaCha20-Poly1305` AEAD or `AES-256-CBC` + `HMAC`.
+- **Per-Hop Path Tracing (`--mtr`):** Traces intermediate router hops via incremental IP `TTL` / `Hop Limit` probes and ICMP `Time Exceeded` capture.
+- **Path MTU Sweep (`--mtu-discover`):** Binary-searches maximum non-fragmented packet sizes (`128..9000` bytes) with Don't Fragment (`DF`) set to uncover asymmetric VPN/tunnel MTU blackholes.
+- **Zero-Downtime Key Rotation & Hot-Reload:** Supports active and staged secrets via `KeyId` (`0x0080`) with `ChaCha20-Poly1305` AEAD or `AES-256-CBC` + `HMAC`, reloaded live via file watch or `SIGHUP`.
 - **Anti-Replay Protection:** Drops duplicate UDP packets per peer using a bounded 30-second sliding-window cache.
-- **Path MTU Sweep (`--mtu-discover`):** Binary-searches maximum non-fragmented packet sizes (`128..9000` bytes) to uncover asymmetric MTU blackholes.
-- **Fleet & DevOps Ready:** Supports declarative TOML configs (`--config`), DNS `SRV` auto-discovery (`--srv`), adaptive loss backoff (`--adaptive`), interactive `--tui`, `--json` NDJSON logs, and Prometheus `/metrics`.
+- **Optional Webhook Alerting (`--features webhooks`):** Excluded from default builds to keep dependencies minimal; enable at compile time for standalone Slack/Discord/PagerDuty degradation and recovery notifications.
+- **SRE & DevOps Ready:** Supports declarative TOML configs (`--config`), DNS `SRV` auto-discovery (`--srv`), adaptive loss backoff (`--adaptive`), interactive `--tui`, `--json` NDJSON logs, and Prometheus `/metrics`.
+
 
 
 ---
@@ -44,10 +47,21 @@ While remaining wire-compatible with the core `2ping` binary framing (`0x3250` m
 
 ### Install `2ping` Globally via Cargo
 
-From the repository root, build and install the `2ping` binary into `~/.cargo/bin`:
+### 1. Default Lean Build (No HTTP Client Dependencies)
+
+From the repository root, run the test suite and install `2ping` into `~/.cargo/bin`:
 
 ```bash
+cargo test
 cargo install --path .
+```
+
+### 2. Optional Build with Standalone Webhook Alerting
+
+To compile in `reqwest` and enable `--webhook-url`:
+
+```bash
+cargo install --path . --features webhooks
 ```
 
 Verify the installation:
@@ -82,7 +96,23 @@ Connect from the client machine:
 2ping <LISTENER_IP_OR_HOST>
 ```
 
-### 2. Modern AEAD Encryption (`ChaCha20-Poly1305`)
+### 2. Multi-Target Probing with Live Terminal UI (`--tui`)
+
+```bash
+2ping 10.0.0.5 10.0.0.12 test.2ping.net --tui
+```
+
+### 3. Per-Hop Path Tracing (`--mtr`) & Path MTU Discovery (`--mtu-discover`)
+
+```bash
+# Trace hop-by-hop latency and packet loss to target
+sudo 2ping 10.0.0.5 --mtr --max-hops 20 --mtr-rounds 5
+
+# Binary-search Path MTU (128..9000B) with Don't Fragment enabled
+2ping 10.0.0.5 --mtu-discover
+```
+
+### 4. Modern AEAD Encryption (`ChaCha20-Poly1305`)
 
 With `ChaCha20-Poly1305` (the default cipher), a single `--encrypt` secret provides full authenticated encryption over both the outer header and inner opcodes:
 
@@ -94,7 +124,7 @@ With `ChaCha20-Poly1305` (the default cipher), a single `--encrypt` secret provi
 2ping <LISTENER_IP_OR_HOST> -c 10 --encrypt "shared-aead-secret"
 ```
 
-### 3. Legacy Compatibility Mode (`AES-256-CBC` + `HMAC`)
+### 5. Legacy Compatibility Mode (`AES-256-CBC` + `HMAC`)
 
 ```bash
 # Listener
@@ -112,7 +142,7 @@ With `ChaCha20-Poly1305` (the default cipher), a single `--encrypt` secret provi
   --encrypt-method aes256-cbc
 ```
 
-### 4. QoS DSCP Testing, JSON Logs & Prometheus Metrics
+### 6. QoS DSCP Testing, JSON Logs & Prometheus Metrics
 
 ```bash
 # Listener exposing Prometheus metrics on :9100
@@ -122,7 +152,7 @@ With `ChaCha20-Poly1305` (the default cipher), a single `--encrypt` secret provi
 2ping <LISTENER_IP_OR_HOST> -c 5 --dscp EF --json
 ```
 
-### 5. Declarative TOML Config & Zero-Downtime Key Rotation
+### 7. Declarative TOML Config & Zero-Downtime Key Rotation
 
 Create `2ping.toml`:
 
@@ -133,6 +163,11 @@ interval = 1.0
 dscp = "EF"
 adaptive = true
 targets = ["10.0.0.5", "10.0.0.12"]
+
+# Optional (requires --features webhooks):
+# webhook_url = "https://slack.com"
+# webhook_loss_threshold = 5.0
+# webhook_rtt_threshold = 150.0
 
 active_key_id = "2026-q4"
 
@@ -145,7 +180,16 @@ id = "2026-q4"
 encrypt_secret = "current-quarter-secret-key"
 ```
 
-### 6. Path MTU Discovery & QoS DSCP Probing
+Run with `--config` and reload keys or targets live at any time via `SIGHUP` (or by editing the file):
+
+```bash
+2ping --config 2ping.toml --tui
+
+# Trigger manual hot-reload without restarting or resetting stats:
+kill -HUP $(pidof 2ping)
+```
+
+### 8. Path MTU Discovery & QoS DSCP Probing
 
 ```bash
 # Binary-search Path MTU (128..9000B) with Don't Fragment set
@@ -160,14 +204,20 @@ encrypt_secret = "current-quarter-secret-key"
 | Flag | Default | Description |
 | :--- | :--- | :--- |
 | `<HOSTS...>` | — | One or more hostnames or IPv4/IPv6 addresses of `2ping` listeners |
-| `--config <FILE>` | — | Load fleet targets, ports, DSCP, and keyring from a TOML file |
-| `--keyring <FILE>` | — | Load multi-key rotation secrets from a TOML keyring file |
+| `--config <FILE>` | — | Load fleet targets, ports, DSCP, and keyring from a TOML file (hot-reloaded) |
+| `--keyring <FILE>` | — | Load multi-key rotation secrets from a TOML keyring file (hot-reloaded) |
 | `--active-key-id <ID>` | First key | Key ID from keyring used to sign/encrypt outgoing packets |
 | `--listen` | `false` | Start in dual-stack IPv4/IPv6 listener mode |
+| `--mtr` | `false` | Run per-hop MTR path trace to target(s) |
+| `--max-hops <N>` | `30` | Maximum TTL/hop limit for `--mtr` tracing |
+| `--mtr-rounds <N>` | `3` | Probe rounds per hop for `--mtr` tracing |
 | `--srv` | `false` | Resolve target hosts via `_2ping._udp.<domain>` DNS `SRV` records |
 | `--mtu-discover` | `false` | Binary-search Path MTU (`128..9000` bytes) with Dont Fragment set |
 | `--tui` | `false` | Launch interactive live terminal UI dashboard (`ratatui`) |
 | `--adaptive` | `false` | Automatically back off probe interval during high packet loss (`>20%`) |
+| `--webhook-url <URL>` | — | Webhook URL for degradation/recovery alerts *(requires `--features webhooks`)* |
+| `--webhook-loss-threshold <PCT>` | `5.0` | Directional packet loss % threshold for webhook alerts *(requires `--features webhooks`)* |
+| `--webhook-rtt-threshold <MS>` | — | Average RTT ms threshold for webhook alerts *(requires `--features webhooks`)* |
 | `--port <PORT>` | `15998` | UDP port to bind (listener) or connect to (client) |
 | `--metrics-port <PORT>` | — | Expose Prometheus `/metrics` HTTP endpoint on the specified port |
 | `-c, --count <N>` | Infinite | Stop after sending `N` pings per target |
@@ -192,20 +242,27 @@ encrypt_secret = "current-quarter-secret-key"
 
 ```text
 2ping-rs/
-├── Cargo.toml                  # Crate manifest (`2ping` binary + library exports)
+├── Cargo.toml                  # Crate manifest (`2ping` binary, library exports, optional `webhooks` feature)
+Use code with caution.
 ├── Dockerfile                  # Multi-stage container build
-├── docker-compose.yml          # Listener + client test stack
+├── docker-compose.yml          # Dual-stack listener, client, and TUI compose stack
+├── .github/workflows/
+│   ├── rust.yml                # PR formatting, Clippy, and test CI
+│   └── release.yml             # Multi-arch static musl binaries + GHCR Docker release workflow
 ├── src/
-│   ├── lib.rs                  # Library module exports
-│   ├── main.rs                 # CLI parsing, TOML config, dual-stack socket & DNS SRV
+│   ├── lib.rs                  # Library module exports and dual-stack target/SRV resolver
+│   ├── main.rs                 # CLI parsing, socket setup, and mode dispatch
 │   ├── config.rs               # TOML fleet configuration and keyring parser
 │   ├── crypto.rs               # PBKDF2 key derivation, Multi-Key Ring, ChaCha20-Poly1305, AES-CBC, HMAC
 │   ├── protocol.rs             # Binary wire encoding, decoding, OWD & KeyId opcodes, checksums
 │   ├── timestamp.rs            # Linux SO_TIMESTAMPNS kernel receive timestamps & UTC wall clock
+│   ├── reload.rs               # SIGHUP and filesystem watcher for zero-downtime hot-reloading
+│   ├── mtr.rs                  # Per-hop TTL/ICMP path tracer
+│   ├── webhooks.rs             # Compile-time gated webhook alert dispatcher
 │   ├── tui.rs                  # Live Ratatui sparkline and directional loss terminal dashboard
 │   └── engine.rs               # Async 3-way state machine, replay cache, MTU sweep, stats & metrics
 └── tests/
-    └── protocol_and_crypto.rs  # Unit and multi-target loopback UDP integration 
+└── protocol_and_crypto.rs  # Unit and multi-target loopback UDP integration tests
 ```
 
 ---

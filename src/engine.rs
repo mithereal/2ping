@@ -2,6 +2,7 @@ use crate::crypto::SecurityConfig;
 use crate::protocol::{hex_id, Packet};
 use crate::timestamp::{enable_kernel_timestamps, now_utc_ns, recv_with_timestamp};
 use crate::tui::run_tui_loop;
+use crate::webhooks::WebhookDispatcher;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -9,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time;
 
 const REPLAY_TTL: Duration = Duration::from_secs(30);
@@ -308,9 +309,10 @@ impl Stats {
             println!(
                 "peer processing latency avg = {:.3} ms (subtracted from rtt)",
                 h_avg
-);
-}
-println!(
+            );
+        }
+        println!(
+Use code with caution.
 "{} raw packets transmitted, {} received ({} dropped/invalid)",
 self.raw_tx, self.raw_rx, self.auth_or_decrypt_errors
 );
@@ -347,7 +349,7 @@ sorted[lower] * (1.0 - weight) + sorted[upper] * weight
 }
 pub struct EngineConfig {
 pub listen_mode: bool,
-pub targets: Vec,
+pub targets: Arc<RwLock<Vec>>,
 pub interval: Duration,
 pub count: Option,
 pub min_packet_size: usize,
@@ -360,14 +362,16 @@ pub mtu_discover: bool,
 pub tui_mode: bool,
 pub adaptive: bool,
 pub metrics_port: Option,
-pub security: SecurityConfig,
+pub security: Arc<RwLock>,
+pub webhook: Arc,
 }
 pub async fn run_engine(socket: UdpSocket, config: EngineConfig) -> std::io::Result<()> {
 let _ = enable_kernel_timestamps(&socket);
 let socket = Arc::new(socket);
 let state = Arc::new(Mutex::new(State::default()));
-let active_key_id = config.security.active_key_id.clone();
-let security = Arc::new(config.security);
+let active_key_id = config.security.read().await.active_key_id.clone();
+let security = Arc::clone(&config.security);
+let targets = Arc::clone(&config.targets);
 let start_time = Instant::now();
 let suppress_stdout = config.quiet || config.tui_mode;
 if !config.json_output && !config.tui_mode {
@@ -378,7 +382,8 @@ socket.local_addr()?,
 active_key_id
 );
 } else {
-for t in &config.targets {
+let t_list = targets.read().await;
+for t in t_list.iter() {
 println!(
 "2PING {} ({}): {} bytes of data.",
 t.name, t.addr, config.min_packet_size
@@ -386,7 +391,7 @@ t.name, t.addr, config.min_packet_size
 }
 }
 }
-// Prometheus /metrics HTTP exporter with OWD and directional loss labels
+// Prometheus /metrics HTTP exporter
 if let Some(m_port) = config.metrics_port {
 let m_state = Arc::clone(&state);
 tokio::spawn(async move {
@@ -468,19 +473,21 @@ let _ = stream.write_all(resp.as_bytes()).await;
 let rx_socket = Arc::clone(&socket);
 let rx_state = Arc::clone(&state);
 let rx_sec = Arc::clone(&security);
+let rx_webhook = Arc::clone(&config.webhook);
 let verbose = config.verbose;
 let three_way = config.three_way;
 let json_output = config.json_output;
 let min_size = config.min_packet_size;
 let pattern = config.pad_pattern.clone();
-let multi_target = config.targets.len() > 1;
+let multi_target = targets.read().await.len() > 1;
 tokio::spawn(async move {
 let mut buf = vec![0u8; 65535];
 while let Ok((len, src, recv_time, recv_wall_ns)) =
 recv_with_timestamp(&rx_socket, &mut buf).await
 {
+let sec_guard = rx_sec.read().await;
 let mut st = rx_state.lock().await;
-let pkt = match Packet::decode(&buf[..len], &rx_sec) {
+let pkt = match Packet::decode(&buf[..len], &sec_guard) {
 Ok(p) => p,
 Err(e) => {
 st.global_stats.auth_or_decrypt_errors += 1;
@@ -532,7 +539,6 @@ let h_ms = (us as f64) / 1000.0;
 }
 None => (raw_rtt_ms, None),
 };
-// Compute clock-synchronized One-Way Delays (outbound & inbound)
 let (out_owd_ms, in_owd_ms) = match (pkt.rx_timestamp_ns, pkt.tx_timestamp_ns) {
 (Some(listener_rx_ns), Some(listener_tx_ns))
 if listener_rx_ns >= client_tx_ns && recv_wall_ns >= listener_tx_ns =>
@@ -552,6 +558,24 @@ t_stats.pings_received += 1;
 t_stats.raw_rx += 1;
 t_stats.record_rtt(net_rtt_ms, host_lat_ms, out_owd_ms, in_owd_ms);
 let cur_jitter = t_stats.jitter_ms;
+let cur_avg_rtt = t_stats.avg_rtt();
+let cur_in_loss_pct = if t_stats.pings_transmitted > 0 {
+(t_stats.inbound_loss as f64 / t_stats.pings_transmitted as f64) * 100.0
+} else {
+0.0
+};
+let wh = Arc::clone(&rx_webhook);
+let wh_target = t_name.clone();
+tokio::spawn(async move {
+wh.evaluate_and_notify(
+&wh_target,
+"inbound",
+cur_in_loss_pct,
+cur_avg_rtt,
+cur_jitter,
+)
+.await;
+});
 if !suppress_stdout {
 if json_output {
 let ev = JsonEvent::Reply {
@@ -610,10 +634,21 @@ None
 };
 if let Some((t_name, seq_num)) = lost_info {
 st.global_stats.inbound_loss += 1;
-st.per_target_stats
-.entry(t_name.clone())
-.or_default()
-.inbound_loss += 1;
+let t_stats = st.per_target_stats.entry(t_name.clone()).or_default();
+t_stats.inbound_loss += 1;
+let loss_pct = if t_stats.pings_transmitted > 0 {
+(t_stats.inbound_loss as f64 / t_stats.pings_transmitted as f64) * 100.0
+} else {
+0.0
+};
+let avg_rtt = t_stats.avg_rtt();
+let jitter = t_stats.jitter_ms;
+let wh = Arc::clone(&rx_webhook);
+let wh_target = t_name.clone();
+tokio::spawn(async move {
+wh.evaluate_and_notify(&wh_target, "inbound", loss_pct, avg_rtt, jitter)
+.await;
+});
 if !suppress_stdout {
 if json_output {
 let ev = JsonEvent::PacketLoss {
@@ -658,7 +693,7 @@ reply.courtesy_expires = courtesy;
 let processing_us = recv_time.elapsed().as_micros().min(u32::MAX as u128) as u32;
 reply.host_latency_us = Some(processing_us);
 reply.tx_timestamp_ns = Some(now_utc_ns());
-let wire = reply.encode(&rx_sec);
+let wire = reply.encode(&sec_guard);
 if rx_socket.send_to(&wire, src).await.is_ok() {
 st.global_stats.raw_tx += 1;
 }
@@ -667,6 +702,7 @@ st.global_stats.raw_tx += 1;
 });
 // Background garbage collector and outbound loss analyzer
 let gc_state = Arc::clone(&state);
+let gc_webhook = Arc::clone(&config.webhook);
 let gc_json = config.json_output;
 tokio::spawn(async move {
 let mut ticker = time::interval(Duration::from_secs(1));
@@ -691,10 +727,21 @@ expired_keys.push(*id);
 }
 for (t_name, peer, seq_num) in outbound_losses {
 st.global_stats.outbound_loss += 1;
-st.per_target_stats
-.entry(t_name.clone())
-.or_default()
-.outbound_loss += 1;
+let t_stats = st.per_target_stats.entry(t_name.clone()).or_default();
+t_stats.outbound_loss += 1;
+let loss_pct = if t_stats.pings_transmitted > 0 {
+(t_stats.outbound_loss as f64 / t_stats.pings_transmitted as f64) * 100.0
+} else {
+0.0
+};
+let avg_rtt = t_stats.avg_rtt();
+let jitter = t_stats.jitter_ms;
+let wh = Arc::clone(&gc_webhook);
+let wh_target = t_name.clone();
+tokio::spawn(async move {
+wh.evaluate_and_notify(&wh_target, "outbound", loss_pct, avg_rtt, jitter)
+.await;
+});
 if !suppress_stdout {
 if gc_json {
 let ev = JsonEvent::PacketLoss {
@@ -721,12 +768,12 @@ let tui_handle = if config.tui_mode {
 let tui_state = Arc::clone(&state);
 let tui_kid = active_key_id.clone();
 Some(tokio::spawn(async move {
-let _ = run_tui_loop(tui_state, tui_kid).await;
+let _ = run_tui_loop(tui_
+state, tui_kid).await;
 }))
 } else {
 None
 };
-// Execution modes: Listener, Path MTU Discovery, or Multi-Target Client Loop
 if config.listen_mode {
 if let Some(handle) = tui_handle {
 let _ = handle.await;
@@ -734,12 +781,11 @@ let _ = handle.await;
 tokio::signal::ctrl_c().await?;
 }
 } else if config.mtu_discover {
-run_mtu_discovery(&socket, &state, &security, &config).await?;
+run_mtu_discovery(&socket, &state, &security, &targets, &config).await?;
 } else {
 let mut seq = 1u64;
 let base_interval = config.interval;
 loop {
-// Adaptive backoff: double interval (up to 10s) when packet loss exceeds 20%
 let current_interval = if config.adaptive {
 let st = state.lock().await;
 let tx = st.global_stats.pings_transmitted;
@@ -764,7 +810,9 @@ time::sleep(Duration::from_millis(500)).await;
 break;
 }
 }
-for target in &config.targets {
+let current_targets = targets.read().await.clone();
+let sec_guard = security.read().await;
+for target in &current_targets {
 let mut pkt = Packet::new();
 pkt.reply_requested = true;
 pkt.min_size = config.min_packet_size;
@@ -806,7 +854,7 @@ let t_stats = st.per_target_stats.entry(target.name.clone()).or_default();
 t_stats.pings_transmitted += 1;
 t_stats.raw_tx += 1;
 }
-let wire = pkt.encode(&security);
+let wire = pkt.encode(&sec_guard);
 socket.send_to(&wire, target.addr).await?;
 }
 seq += 1;
@@ -825,7 +873,8 @@ if config.listen_mode {
 st.global_stats
 .print_summary("listener", start_time.elapsed(), config.json_output);
 } else {
-for t in &config.targets {
+let t_list = targets.read().await;
+for t in t_list.iter() {
 let stats = st
 .per_target_stats
 .get(&t.name)
@@ -839,10 +888,13 @@ Ok(())
 async fn run_mtu_discovery(
 socket: &UdpSocket,
 state: &Arc<Mutex>,
-security: &Arc,
+security: &Arc<RwLock>,
+targets: &Arc<RwLock<Vec>>,
 config: &EngineConfig,
 ) -> std::io::Result<()> {
-for target in &config.targets {
+let target_list = targets.read().await.clone();
+let sec_guard = security.read().await;
+for target in &target_list {
 if !config.json_output {
 println!("Discovering Path MTU to {} ({})...", target.name, target.addr);
 }
@@ -876,7 +928,7 @@ let t_stats = st.per_target_stats.entry(target.name.clone()).or_default();
 t_stats.pings_transmitted += 1;
 t_stats.raw_tx += 1;
 }
-let wire = pkt.encode(security);
+let wire = pkt.encode(&sec_guard);
 let actual_payload_len = wire.len();
 if socket.send_to(&wire, target.addr).await.is_err() {
 high = mid - 1;

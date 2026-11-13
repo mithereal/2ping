@@ -1,12 +1,16 @@
 [package]
 name = "twoping"
-version = "1.0.0"
+version = "1.2.0"
 edition = "2021"
-description = "Enterprise bi-directional ping utility in Rust with OWD, TUI, multi-key rotation, multi-target probing, dual-stack IPv6, DNS SRV, Path MTU discovery, ChaCha20-Poly1305 AEAD, kernel timestamps, and Prometheus metrics"
+description = "Enterprise bi-directional ping utility in Rust with hot-reloadable keyrings, per-hop MTR tracing, optional webhook alerts, OWD, TUI, multi-target probing, dual-stack IPv6, DNS SRV, Path MTU discovery, ChaCha20-Poly1305 AEAD, kernel timestamps, and Prometheus metrics"
 
 [[bin]]
 name = "2ping"
 path = "src/main.rs"
+
+[features]
+default = []
+webhooks = ["dep:reqwest"]
 
 [dependencies]
 aes = "0.8"
@@ -18,9 +22,11 @@ hickory-resolver = "0.24"
 hmac = "0.12"
 libc = "0.2"
 md-5 = "0.10"
+notify = "6.1"
 pbkdf2 = "0.12"
 rand = "0.8"
 ratatui = "0.28"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

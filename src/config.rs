@@ -14,6 +14,9 @@ pub struct AppConfigFile {
     pub dscp: Option<String>,
     pub srv: Option<bool>,
     pub adaptive: Option<bool>,
+    pub webhook_url: Option<String>,
+    pub webhook_loss_threshold: Option<f64>,
+    pub webhook_rtt_threshold: Option<f64>,
     pub active_key_id: Option<String>,
     #[serde(default)]
     pub keys: Vec<KeyEntry>,

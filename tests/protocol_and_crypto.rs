@@ -1,9 +1,12 @@
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
+use tokio::sync::RwLock;
 use twoping::config::KeyEntry;
 use twoping::crypto::{AuthDigest, EncryptMethod, SecurityConfig};
 use twoping::engine::{run_engine, EngineConfig, TargetSpec};
 use twoping::protocol::{opcodes, Packet, MAGIC_NUMBER};
+use twoping::webhooks::{WebhookConfig, WebhookDispatcher};
 
 #[test]
 fn test_plaintext_roundtrip_and_v1_opcodes() {
@@ -100,6 +103,57 @@ fn test_hmac_authentication_digests_and_tamper_rejection() {
 }
 
 #[test]
+fn test_legacy_aes256_cbc_and_hmac_compatibility() {
+    let sec = SecurityConfig::new(
+        Some("legacy-hmac-passphrase"),
+        AuthDigest::HmacSha512,
+        Some("legacy-aes256-passphrase"),
+        EncryptMethod::Aes256Cbc,
+    );
+    let wrong_enc_sec = SecurityConfig::new(
+        Some("legacy-hmac-passphrase"),
+        AuthDigest::HmacSha512,
+        Some("wrong-aes256-passphrase"),
+        EncryptMethod::Aes256Cbc,
+    );
+
+    let mut pkt = Packet::new();
+    pkt.reply_requested = true;
+    pkt.in_reply_to = Some([0x99; 6]);
+    pkt.ping_time_us = Some(88_888);
+
+    let wire = pkt.encode(&sec);
+    let outer_flags = u16::from_be_bytes([wire[10], wire[11]]);
+    assert_eq!(outer_flags, opcodes::HMAC | opcodes::ENCRYPTED);
+
+    let decoded =
+        Packet::decode(&wire, &sec).expect("Legacy AES-256-CBC + HMAC packet should decode");
+    assert!(decoded.reply_requested);
+    assert_eq!(decoded.in_reply_to, Some([0x99; 6]));
+    assert_eq!(decoded.ping_time_us, Some(88_888));
+
+    // Wrong AES secret fails decryption
+    assert_eq!(
+        Packet::decode(&wire, &wrong_enc_sec).unwrap_err(),
+        "AES-256-CBC decryption or PKCS7 padding failed"
+    );
+
+    // Tampering with ciphertext is caught by HMAC before decryption (Encrypt-then-MAC)
+    let mut tampered = wire.clone();
+    let mid = tampered.len() / 2;
+    tampered[mid] ^= 0xFF;
+    tampered[2] = 0;
+    tampered[3] = 0;
+    let csum = recompute_ones_complement(&tampered);
+    tampered[2..4].copy_from_slice(&csum.to_be_bytes());
+
+    assert_eq!(
+        Packet::decode(&tampered, &sec).unwrap_err(),
+        "HMAC authentication failed"
+    );
+}
+
+#[test]
 fn test_multi_key_rotation_aead_and_hmac() {
     let entries = vec![
         KeyEntry {
@@ -114,7 +168,6 @@ fn test_multi_key_rotation_aead_and_hmac() {
         },
     ];
 
-    // Listener holds both Q3 and Q4 keys, defaulting to Q4
     let listener_sec = SecurityConfig::from_keyring(
         &entries,
         Some("2026-q4"),
@@ -123,7 +176,6 @@ fn test_multi_key_rotation_aead_and_hmac() {
     )
     .unwrap();
 
-    // Client 1 is still sending packets signed/encrypted with Q3
     let client_q3 = SecurityConfig::from_keyring(
         &entries,
         Some("2026-q3"),
@@ -143,13 +195,11 @@ fn test_multi_key_rotation_aead_and_hmac() {
         opcodes::HMAC | opcodes::KEY_ID | opcodes::ENCRYPTED
     );
 
-    // Listener decodes Q3 packet seamlessly and identifies the key ID
     let decoded = Packet::decode(&wire, &listener_sec)
         .expect("Listener should accept retired Q3 key during rotation");
     assert_eq!(decoded.key_id.as_deref(), Some("2026-q3"));
     assert_eq!(decoded.tx_timestamp_ns, Some(999_888_777));
 
-    // A listener that only has Q4 rejects the Q3 packet
     let q4_only_listener = SecurityConfig::from_keyring(
         &entries[1..],
         Some("2026-q4"),
@@ -199,9 +249,9 @@ fn test_chacha20_poly1305_aead_and_header_binding() {
         "ChaCha20-Poly1305 AEAD authentication or decryption failed"
     );
 
-    // Tamper with the unencrypted message_id in the outer header (AAD binding check)
+    // Tamper with unencrypted message_id in the outer header (AAD binding check)
     let mut tampered = wire.clone();
-    tampered[4] ^= 0xFF;
+    tampered[5] ^= 0xFF;
     tampered[2] = 0;
     tampered[3] = 0;
     let csum = recompute_ones_complement(&tampered);
@@ -228,11 +278,14 @@ async fn test_multi_target_aead_3way_loopback() {
         EncryptMethod::ChaCha20Poly1305,
     );
 
-    let sec1 = sec.clone();
+    let webhook = Arc::new(WebhookDispatcher::new(WebhookConfig::default()));
+
+    let sec1 = Arc::new(RwLock::new(sec.clone()));
+    let wh1 = Arc::clone(&webhook);
     let h1 = tokio::spawn(async move {
         let cfg = EngineConfig {
             listen_mode: true,
-            targets: vec![],
+            targets: Arc::new(RwLock::new(vec![])),
             interval: Duration::from_secs(1),
             count: None,
             min_packet_size: 128,
@@ -246,76 +299,76 @@ async fn test_multi_target_aead_3way_loopback() {
             adaptive: false,
             metrics_port: None,
             security: sec1,
+            webhook: wh1,
         };
         let _ = run_engine(listener1, cfg).await;
     });
 
-    let sec2 = sec.clone();
+    let sec2 = Arc::new(RwLock::new(sec.clone()));
+    let wh2 = Arc::clone(&webhook);
     let h2 = tokio::spawn(async move {
         let cfg = EngineConfig {
             listen_mode: true,
-            targets: vec![],
-            interval: Duration::from_secs(1),
-            count: None,
-            min_packet_size: 128,
-            pad_pattern: vec![],
-            quiet: true,
-            verbose: false,
-            three_way: true,
-            json_output: false,
-            mtu_discover: false,
-            tui_mode: false,
-            adaptive: false,
-            metrics_port: None,
-            security: sec2,
-        };
-        let _ = run_engine(listener2, cfg).await;
-    });
-
-    let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let client_cfg = EngineConfig {
-        listen_mode: false,
-        targets: vec![
-            TargetSpec {
-                name: "node-alpha".into(),
-                addr: addr1,
-            },
-            TargetSpec {
-                name: "node-beta".into(),
-                addr: addr2,
-            },
-        ],
-        interval: Duration::from_millis(50),
-        count: Some(3),
-        min_packet_size: 128,
-        pad_pattern: vec![0xAA],
-        quiet: true,
-        verbose: false,
-        three_way: true,
-        json_output: false,
-        mtu_discover: false,
-        tui_mode: false,
-        adaptive: false,
-        metrics_port: None,
-        security: sec,
-    };
-
-    let result = tokio::time::timeout(
-        Duration::from_secs(3),
-        run_engine(client_socket, client_cfg),
-    )
-    .await
-    .expect("Multi-target client should complete within 3 seconds");
-
-    assert!(result.is_ok());
-    h1.abort();
-    h2.abort();
+targets: Arc::new(RwLock::new(vec![])),
+interval: Duration::from_secs(1),
+count: None,
+min_packet_size: 128,
+pad_pattern: vec![],
+quiet: true,
+verbose: false,
+three_way: true,
+json_output: false,
+mtu_discover: false,
+tui_mode: false,
+adaptive: false,
+metrics_port: None,
+security: sec2,
+webhook: wh2,
+};
+let _ = run_engine(listener2, cfg).await;
+});
+let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+let client_cfg = EngineConfig {
+listen_mode: false,
+targets: Arc::new(RwLock::new(vec![
+TargetSpec {
+name: "node-alpha".into(),
+addr: addr1,
+},
+TargetSpec {
+name: "node-beta".into(),
+addr: addr2,
+},
+])),
+interval: Duration::from_millis(50),
+count: Some(3),
+min_packet_size: 128,
+pad_pattern: vec![0xAA],
+quiet: true,
+verbose: false,
+three_way: true,
+json_output: false,
+mtu_discover: false,
+tui_mode: false,
+adaptive: false,
+metrics_port: None,
+security: Arc::new(RwLock::new(sec)),
+webhook,
+};
+let result = tokio::time::timeout(
+Duration::from_secs(3),
+run_engine(client_socket, client_cfg),
+)
+.await
+.expect("Multi-target client should complete within 3 seconds");
+assert!(result.is_ok());
+h1.abort();
+h2.abort();
 }
-
 fn recompute_ones_complement(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    let mut chunks = data.chunks_exact(2);
-    for chunk in &mut chunks {
+let mut sum: u32 = 0;
+let mut chunks = data.chunks_exact(2);
+for chunk in &mut chunks {
 sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
 }
 if let Some(&rem) = chunks.remainder().first() {
