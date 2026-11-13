@@ -1,4 +1,4 @@
-use crate::crypto::SecurityConfig;
+use crate::crypto::{EncryptMethod, SecurityConfig};
 use rand::RngCore;
 use std::io::{Cursor, Read};
 
@@ -45,7 +45,14 @@ impl Packet {
         hex_id(&self.message_id)
     }
 
-    /// Serializes inner opcodes (0x0002 .. 0x0020) without HMAC or Encryption.
+    fn build_canonical_aad(message_id: &[u8; 6], outer_flags: u16) -> [u8; 12] {
+        let mut aad = [0u8; 12];
+        aad[0..2].copy_from_slice(&MAGIC_NUMBER.to_be_bytes());
+        aad[4..10].copy_from_slice(message_id);
+        aad[10..12].copy_from_slice(&outer_flags.to_be_bytes());
+        aad
+    }
+
     fn encode_inner_opcodes(&self) -> (u16, Vec<u8>) {
         let mut flags: u16 = 0;
         let mut data = Vec::new();
@@ -93,28 +100,35 @@ impl Packet {
         (flags, data)
     }
 
-    /// Encodes the packet into wire bytes, applying AES-256-CBC encryption and/or HMAC.
     pub fn encode(&self, sec: &SecurityConfig) -> Vec<u8> {
         let (mut flags, mut opcode_data) = self.encode_inner_opcodes();
 
-        // 1. Encrypt inner flags + opcode payload if --encrypt is enabled
         if sec.encrypt_key.is_some() {
             let mut plaintext = Vec::with_capacity(2 + opcode_data.len());
             plaintext.extend_from_slice(&flags.to_be_bytes());
             plaintext.extend_from_slice(&opcode_data);
 
-            let encrypted_blob = sec
-                .encrypt_aes256_cbc(&plaintext)
-                .expect("Encryption key present");
+            let mut outer_flags = opcodes::ENCRYPTED;
+            if sec.auth_digest.is_some() {
+                outer_flags |= opcodes::HMAC;
+            }
+            let aad = Self::build_canonical_aad(&self.message_id, outer_flags);
 
-            // Outer flags clear plaintext opcode bits and set ENCRYPTED (0x8000)
+            let encrypted_blob = match sec.encrypt_method {
+                EncryptMethod::ChaCha20Poly1305 => sec
+                    .encrypt_chacha20_poly1305(&plaintext, &aad)
+                    .expect("AEAD key present"),
+                EncryptMethod::Aes256Cbc => sec
+                    .encrypt_aes256_cbc(&plaintext)
+                    .expect("AES key present"),
+            };
+
             flags = opcodes::ENCRYPTED;
             opcode_data.clear();
             opcode_data.extend_from_slice(&(encrypted_blob.len() as u16).to_be_bytes());
             opcode_data.extend_from_slice(&encrypted_blob);
         }
 
-        // 2. Reserve HMAC opcode slot (0x0040) before ENCRYPTED (0x8000) in ascending bit order
         let mut hmac_offset = None;
         let mut hmac_field_len = 0usize;
 
@@ -122,7 +136,6 @@ impl Packet {
             flags |= opcodes::HMAC;
             hmac_field_len = 1 + digest.tag_len();
 
-            // Insert HMAC TLV before ENCRYPTED TLV if ENCRYPTED is set
             let insert_pos = if (flags & opcodes::ENCRYPTED) != 0 {
                 0
             } else {
@@ -137,7 +150,6 @@ impl Packet {
             hmac_offset = Some(MIN_HEADER_LEN + insert_pos + 2);
         }
 
-        // 3. Assemble header + opcodes + padding
         let mut buf = Vec::with_capacity(self.min_size.max(MIN_HEADER_LEN + opcode_data.len()));
         buf.extend_from_slice(&MAGIC_NUMBER.to_be_bytes());
         buf.extend_from_slice(&[0x00, 0x00]); // Checksum placeholder
@@ -156,35 +168,32 @@ impl Packet {
             }
         }
 
-        // 4. Compute HMAC over entire frame (with checksum and HMAC value zeroed)
         if let Some(offset) = hmac_offset {
             let tag = sec.compute_hmac(&buf).expect("HMAC key present");
             buf[offset..offset + hmac_field_len].copy_from_slice(&tag);
         }
 
-        // 5. Compute and insert 16-bit one's complement checksum
         let csum = compute_checksum(&buf);
         buf[2..4].copy_from_slice(&csum.to_be_bytes());
 
         buf
     }
 
-    /// Decodes a raw UDP packet, verifying checksum, HMAC authenticity, and decrypting if needed.
     pub fn decode(data: &[u8], sec: &SecurityConfig) -> Result<Self, &'static str> {
         if data.len() < MIN_HEADER_LEN {
             return Err("Packet too short");
         }
 
-        let magic = u16::from_be_bytes([data[0], data[1]]);
+        let magic = u16::from_be_bytes([data, data]);
         if magic != MAGIC_NUMBER {
             return Err("Invalid magic number");
         }
 
-        let packet_csum = u16::from_be_bytes([data[2], data[3]]);
+        let packet_csum = u16::from_be_bytes([data, data]);
         if packet_csum != 0 {
             let mut verify_buf = data.to_vec();
-            verify_buf[2] = 0;
-            verify_buf[3] = 0;
+            verify_buf = 0;
+            verify_buf = 0;
             if compute_checksum(&verify_buf) != packet_csum {
                 return Err("Checksum mismatch");
             }
@@ -192,9 +201,8 @@ impl Packet {
 
         let mut message_id = [0u8; 6];
         message_id.copy_from_slice(&data[4..10]);
-        let outer_flags = u16::from_be_bytes([data[10], data[11]]);
+        let outer_flags = u16::from_be_bytes([data, data]);
 
-        // Enforce local security policy
         if sec.auth_key.is_some() && (outer_flags & opcodes::HMAC) == 0 {
             return Err("Rejected unauthenticated packet (--auth required)");
         }
@@ -238,14 +246,13 @@ impl Packet {
             }
         }
 
-        // Verify HMAC before decrypting (Encrypt-then-MAC protection against padding oracles)
         if let Some((offset, tag_bytes)) = hmac_span {
             if sec.auth_key.is_none() {
                 return Err("Received HMAC packet without --auth key configured");
             }
             let mut auth_buf = data.to_vec();
-            auth_buf[2] = 0;
-            auth_buf[3] = 0;
+            auth_buf = 0;
+            auth_buf = 0;
             for b in &mut auth_buf[offset..offset + tag_bytes.len()] {
                 *b = 0;
             }
@@ -260,19 +267,23 @@ impl Packet {
             ..Default::default()
         };
 
-        // Decrypt inner flags and opcodes if ENCRYPTED flag was set
         if let Some(blob) = encrypted_blob {
-            let plaintext = sec.decrypt_aes256_cbc(&blob)?;
+            let aad = Self::build_canonical_aad(&message_id, outer_flags);
+            let plaintext = match sec.encrypt_method {
+                EncryptMethod::ChaCha20Poly1305 => sec.decrypt_chacha20_poly1305(&blob, &aad)?,
+                EncryptMethod::Aes256Cbc => sec.decrypt_aes256_cbc(&blob)?,
+            };
+
             if plaintext.len() < 2 {
                 return Err("Decrypted payload too short");
             }
-            let inner_flags = u16::from_be_bytes([plaintext[0], plaintext[1]]);
+            let inner_flags = u16::from_be_bytes([plaintext, plaintext]);
             pkt.reply_requested = (inner_flags & opcodes::REPLY_REQUESTED) != 0;
 
             let mut inner_cursor = Cursor::new(&plaintext[2..]);
             for bit in 1..16 {
                 let flag = 1u16 << bit;
-                if (inner_flags & flag) == 0 {
+if (inner_flags & flag) == 0 {
 continue;
 }
 let mut len_bytes = [0u8; 2];
@@ -309,12 +320,12 @@ self.courtesy_expires.push(id);
 }
 opcodes::PING_TIME if payload.len() >= 4 => {
 self.ping_time_us = Some(u32::from_be_bytes([
-payload[0], payload[1], payload[2], payload[3],
+payload, payload, payload, payload,
 ]));
 }
 opcodes::HOST_LATENCY if payload.len() >= 4 => {
 self.host_latency_us = Some(u32::from_be_bytes([
-payload[0], payload[1], payload[2], payload[3],
+payload, payload, payload, payload,
 ]));
 }
 opcodes::INVESTIGATE => {
@@ -331,14 +342,14 @@ _ => {}
 pub fn hex_id(id: &[u8; 6]) -> String {
 format!(
 "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-id[0], id[1], id[2], id[3], id[4], id[5]
+id, id, id, id, id, id
 )
 }
 fn compute_checksum(data: &[u8]) -> u16 {
 let mut sum: u32 = 0;
 let mut chunks = data.chunks_exact(2);
 for chunk in &mut chunks {
-sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+sum += u16::from_be_bytes([chunk, chunk]) as u32;
 }
 if let Some(&rem) = chunks.remainder().first() {
 sum += (rem as u32) << 8;

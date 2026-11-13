@@ -1,6 +1,6 @@
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use twoping::crypto::{AuthDigest, SecurityConfig};
+use twoping::crypto::{AuthDigest, EncryptMethod, SecurityConfig};
 use twoping::engine::{run_engine, EngineConfig};
 use twoping::protocol::{opcodes, Packet, MAGIC_NUMBER};
 
@@ -38,7 +38,6 @@ fn test_checksum_tampering_rejected() {
     let pkt = Packet::new();
     let mut wire = pkt.encode(&sec);
 
-    // Flip a bit in the padding area
     let last_idx = wire.len() - 1;
     wire[last_idx] ^= 0x01;
 
@@ -53,8 +52,18 @@ fn test_hmac_authentication_digests_and_tamper_rejection() {
         AuthDigest::HmacSha256,
         AuthDigest::HmacSha512,
     ] {
-        let sender_sec = SecurityConfig::new(Some("super-secret-key"), digest, None);
-        let wrong_sec = SecurityConfig::new(Some("wrong-secret-key"), digest, None);
+        let sender_sec = SecurityConfig::new(
+            Some("super-secret-key"),
+            digest,
+            None,
+            EncryptMethod::ChaCha20Poly1305,
+        );
+        let wrong_sec = SecurityConfig::new(
+            Some("wrong-secret-key"),
+            digest,
+            None,
+            EncryptMethod::ChaCha20Poly1305,
+        );
         let no_auth_sec = SecurityConfig::default();
 
         let mut pkt = Packet::new();
@@ -62,28 +71,21 @@ fn test_hmac_authentication_digests_and_tamper_rejection() {
         pkt.ping_time_us = Some(5_000);
 
         let wire = pkt.encode(&sender_sec);
-
-        // Verify HMAC flag is set on the wire
         let outer_flags = u16::from_be_bytes([wire[10], wire[11]]);
         assert_ne!(outer_flags & opcodes::HMAC, 0);
 
-        // 1. Valid key succeeds
         let decoded = Packet::decode(&wire, &sender_sec).expect("Valid HMAC should succeed");
         assert_eq!(decoded.ping_time_us, Some(5_000));
 
-        // 2. Wrong key fails
         assert_eq!(
             Packet::decode(&wire, &wrong_sec).unwrap_err(),
             "HMAC authentication failed"
         );
-
-        // 3. Unauthenticated peer rejects signed packet
         assert_eq!(
             Packet::decode(&wire, &no_auth_sec).unwrap_err(),
             "Received HMAC packet without --auth key configured"
         );
 
-        // 4. Signed peer rejects unsigned packet
         let unsigned_wire = pkt.encode(&no_auth_sec);
         assert_eq!(
             Packet::decode(&unsigned_wire, &sender_sec).unwrap_err(),
@@ -93,16 +95,67 @@ fn test_hmac_authentication_digests_and_tamper_rejection() {
 }
 
 #[test]
+fn test_chacha20_poly1305_aead_and_header_binding() {
+    let sec = SecurityConfig::new(
+        None,
+        AuthDigest::HmacSha256,
+        Some("aead-passphrase"),
+        EncryptMethod::ChaCha20Poly1305,
+    );
+    let wrong_sec = SecurityConfig::new(
+        None,
+        AuthDigest::HmacSha256,
+        Some("wrong-aead-passphrase"),
+        EncryptMethod::ChaCha20Poly1305,
+    );
+
+    let mut pkt = Packet::new();
+    pkt.reply_requested = true;
+    pkt.in_reply_to = Some([0x42; 6]);
+    pkt.host_latency_us = Some(750);
+
+    let wire = pkt.encode(&sec);
+
+    let outer_flags = u16::from_be_bytes([wire[10], wire[11]]);
+    assert_eq!(outer_flags, opcodes::ENCRYPTED);
+
+    let decoded = Packet::decode(&wire, &sec).expect("AEAD packet should decode");
+    assert!(decoded.reply_requested);
+    assert_eq!(decoded.in_reply_to, Some([0x42; 6]));
+    assert_eq!(decoded.host_latency_us, Some(750));
+
+    assert_eq!(
+        Packet::decode(&wire, &wrong_sec).unwrap_err(),
+        "ChaCha20-Poly1305 AEAD authentication or decryption failed"
+    );
+
+    // Tamper with the unencrypted message_id in the outer header (AAD binding check)
+    let mut tampered = wire.clone();
+    tampered[4] ^= 0xFF;
+    tampered[2] = 0;
+    tampered[3] = 0;
+    let csum = recompute_ones_complement(&tampered);
+    tampered[2..4].copy_from_slice(&csum.to_be_bytes());
+
+    assert_eq!(
+        Packet::decode(&tampered, &sec).unwrap_err(),
+        "ChaCha20-Poly1305 AEAD authentication or decryption failed"
+    );
+}
+
+#[test]
 fn test_aes256_cbc_encryption_and_encrypt_then_mac() {
     let sec = SecurityConfig::new(
         Some("hmac-passphrase"),
         AuthDigest::HmacSha256,
         Some("aes-encryption-passphrase"),
+        EncryptMethod::Aes256Cbc,
     );
     let wrong_enc_sec = SecurityConfig::new(
         Some("hmac-passphrase"),
         AuthDigest::HmacSha256,
         Some("bad-encryption-passphrase"),
+        EncryptMethod::Aes256Cbc,
     );
 
     let mut pkt = Packet::new();
@@ -111,51 +164,33 @@ fn test_aes256_cbc_encryption_and_encrypt_then_mac() {
     pkt.ping_time_us = Some(88_888);
 
     let wire = pkt.encode(&sec);
-
-    // Outer flags should ONLY have HMAC and ENCRYPTED set (inner flags are hidden)
     let outer_flags = u16::from_be_bytes([wire[10], wire[11]]);
     assert_eq!(outer_flags, opcodes::HMAC | opcodes::ENCRYPTED);
 
-    // Round-trip decode with matching keys
     let decoded = Packet::decode(&wire, &sec).expect("Authenticated + encrypted packet decodes");
     assert!(decoded.reply_requested);
     assert_eq!(decoded.in_reply_to, Some([0x99; 6]));
     assert_eq!(decoded.ping_time_us, Some(88_888));
 
-    // Wrong encryption key fails decryption
     assert_eq!(
         Packet::decode(&wire, &wrong_enc_sec).unwrap_err(),
         "AES-256-CBC decryption or PKCS7 padding failed"
     );
-
-    // Tampering with ciphertext is caught by HMAC BEFORE decryption is attempted
-    let mut tampered_wire = wire.clone();
-    tampered_wire[65] ^= 0xFF;
-    // Recompute valid outer checksum to ensure HMAC catches it rather than checksum
-    tampered_wire[2] = 0;
-    tampered_wire[3] = 0;
-    let csum = recompute_ones_complement(&tampered_wire);
-    tampered_wire[2..4].copy_from_slice(&csum.to_be_bytes());
-
-    assert_eq!(
-        Packet::decode(&tampered_wire, &sec).unwrap_err(),
-        "HMAC authentication failed"
-    );
 }
 
 #[tokio::test]
-async fn test_end_to_end_encrypted_3way_loopback() {
+async fn test_end_to_end_aead_3way_loopback() {
     let listener_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let listener_addr = listener_socket.local_addr().unwrap();
 
     let listener_sec = SecurityConfig::new(
-        Some("loopback-auth"),
+        None,
         AuthDigest::HmacSha512,
-        Some("loopback-enc"),
+        Some("loopback-chacha-key"),
+        EncryptMethod::ChaCha20Poly1305,
     );
     let client_sec = listener_sec.clone();
 
-    // Spawn background listener
     let listener_handle = tokio::spawn(async move {
         let cfg = EngineConfig {
             listen_mode: true,
@@ -168,12 +203,13 @@ async fn test_end_to_end_encrypted_3way_loopback() {
             quiet: true,
             verbose: false,
             three_way: true,
+            json_output: false,
+            metrics_port: None,
             security: listener_sec,
         };
         let _ = run_engine(listener_socket, cfg).await;
     });
 
-    // Run client sending 3 pings at 50ms intervals
     let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let client_cfg = EngineConfig {
         listen_mode: false,
@@ -186,6 +222,8 @@ async fn test_end_to_end_encrypted_3way_loopback() {
         quiet: true,
         verbose: false,
         three_way: true,
+        json_output: false,
+        metrics_port: None,
         security: client_sec,
     };
 
