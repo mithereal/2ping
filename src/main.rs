@@ -1,41 +1,72 @@
 use clap::Parser;
+use hickory_resolver::TokioAsyncResolver;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::net::UdpSocket;
+use twoping::config::{AppConfigFile, KeyringFile};
 use twoping::crypto::{AuthDigest, EncryptMethod, SecurityConfig};
-use twoping::engine::{run_engine, EngineConfig};
+use twoping::engine::{run_engine, EngineConfig, TargetSpec};
 use twoping::protocol::DEFAULT_PORT;
 
 #[derive(Parser, Debug)]
-#[command(name = "2ping", version, about = "A bi-directional ping utility in Rust")]
+#[command(name = "2ping", version, about = "Enterprise bi-directional ping utility in Rust")]
 struct Cli {
-    /// Hostname or IP address of the 2ping listener
-    host: Option<String>,
+    /// One or more hostnames or IP addresses of 2ping listeners
+    hosts: Vec<String>,
 
-    /// Start in listener mode
+    /// Path to a TOML configuration file
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Path to a TOML keyring file for zero-downtime key rotation
+    #[arg(long)]
+    keyring: Option<PathBuf>,
+
+    /// Active key ID to sign/encrypt outgoing packets with when using --keyring
+    #[arg(long)]
+    active_key_id: Option<String>,
+
+    /// Launch interactive live terminal UI dashboard
+    #[arg(long)]
+    tui: bool,
+
+    /// Start in dual-stack listener mode (IPv4 + IPv6)
     #[arg(long)]
     listen: bool,
 
-    /// Stop after sending count pings
+    /// Resolve target hosts via _2ping._udp.<domain> DNS SRV records
+    #[arg(long)]
+    srv: bool,
+
+    /// Binary-search Path MTU (128..9000 bytes) with Don't Fragment enabled
+    #[arg(long)]
+    mtu_discover: bool,
+
+    /// Automatically slow down probe rate during high packet loss (>20%)
+    #[arg(long)]
+    adaptive: bool,
+
+    /// Stop after sending count pings per target
     #[arg(short = 'c', long)]
     count: Option<u64>,
 
     /// Wait interval seconds between sending each packet
-    #[arg(short = 'i', long, default_value = "1.0")]
-    interval: f64,
+    #[arg(short = 'i', long)]
+    interval: Option<f64>,
 
     /// UDP port to bind or connect to
-    #[arg(long, default_value_t = DEFAULT_PORT)]
-    port: u16,
+    #[arg(long)]
+    port: Option<u16>,
 
     /// Expose Prometheus /metrics HTTP endpoint on the specified port
     #[arg(long)]
     metrics_port: Option<u16>,
 
     /// Minimum packet size in bytes
-    #[arg(long, default_value_t = 128)]
-    min_packet_size: usize,
+    #[arg(long)]
+    min_packet_size: Option<usize>,
 
     /// Ping compatibility payload size (sets min-packet-size to bytes + 8)
     #[arg(short = 's', long)]
@@ -130,107 +161,212 @@ fn parse_hex_pattern(hex: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-fn bind_configured_socket(bind_addr: SocketAddr, tos_byte: Option<u8>) -> std::io::Result<UdpSocket> {
-    let domain = if bind_addr.is_ipv6() {
-        Domain::IPV6
-    } else {
-        Domain::IPV4
-    };
-    let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+fn bind_dual_stack_socket(
+    port: u16,
+    tos_byte: Option<u8>,
+    dont_fragment: bool,
+) -> std::io::Result<UdpSocket> {
+    let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_only_v6(false)?;
     sock.set_nonblocking(true)?;
 
     if let Some(tos) = tos_byte {
-        if bind_addr.is_ipv4() {
-            sock.set_tos(tos as u32)?;
-        } else {
-            #[cfg(any(
-                target_os = "linux",
-                target_os = "android",
-                target_os = "macos",
-                target_os = "freebsd"
-            ))]
-            sock.set_tclass_v6(tos as u32)?;
+        let _ = sock.set_tos(tos as u32);
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "freebsd"
+        ))]
+        let _ = sock.set_tclass_v6(tos as u32);
+    }
+
+    if dont_fragment {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            use std::os::fd::AsRawFd;
+            let val: libc::c_int = libc::IP_PMTUDISC_DO;
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_MTU_DISCOVER,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            let val6: libc::c_int = libc::IPV6_PMTUDISC_DO;
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::IPPROTO_IPV6,
+                libc::IPV6_MTU_DISCOVER,
+                &val6 as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
         }
     }
 
+    let bind_addr: SocketAddr = format!("[::]:{}", port).parse().unwrap();
     sock.bind(&bind_addr.into())?;
+
     let std_sock: std::net::UdpSocket = sock.into();
     UdpSocket::from_std(std_sock)
+}
+
+fn normalize_for_dual_stack(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(v4) => SocketAddr::new(v4.ip().to_ipv6_mapped().into(), v4.port()),
+        SocketAddr::V6(v6) => SocketAddr::V6(v6),
+    }
+}
+
+async fn resolve_targets(
+    hosts: &[String],
+    default_port: u16,
+    use_srv: bool,
+) -> Result<Vec<TargetSpec>, Box<dyn std::error::Error>> {
+    let mut specs = Vec::new();
+    let resolver = if use_srv {
+        Some(TokioAsyncResolver::tokio_from_system_conf()?)
+    } else {
+        None
+    };
+
+    for host in hosts {
+        if let Some(ref res) = resolver {
+            let srv_query = format!("_2ping._udp.{}.", host.trim_end_matches('.'));
+            let srv_lookup = res.srv_lookup(&srv_query).await?;
+            let record = srv_lookup
+                .iter()
+                .min_by_key(|r| (r.priority(), std::cmp::Reverse(r.weight())))
+                .ok_or_else(|| format!("No SRV records found for {}", srv_query))?;
+
+            let target_host = record.target().to_utf8();
+            let addr_str = format!("{}:{}", target_host.trim_end_matches('.'), record.port());
+            let resolved = addr_str
+                .to_socket_addrs()?
+                .next()
+                .ok_or_else(|| format!("Unable to resolve SRV target {}", addr_str))?;
+
+            specs.push(TargetSpec {
+                name: format!("{} ({}:{})", host, target_host.trim_end_matches('.'), record.port()),
+                addr: normalize_for_dual_stack(resolved),
+            });
+        } else {
+            let addr_str = if host.starts_with('[') || host.matches(':').count() == 1 {
+                host.clone()
+            } else if host.contains(':') {
+                format!("[{}]:{}", host, default_port)
+            } else {
+                format!("{}:{}", host, default_port)
+            };
+
+            let resolved = addr_str
+                .to_socket_addrs()?
+                .next()
+                .ok_or_else(|| format!("Unable to resolve host '{}'", host))?;
+
+            specs.push(TargetSpec {
+                name: host.clone(),
+                addr: normalize_for_dual_stack(resolved),
+            });
+        }
+    }
+
+    Ok(specs)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    if !cli.listen && cli.host.is_none() {
-        eprintln!("Error: Must specify either a target host or --listen");
+    let file_cfg = match &cli.config {
+        Some(path) => AppConfigFile::load(path)?,
+        None => AppConfigFile::default(),
+    };
+
+    let listen_mode = cli.listen || file_cfg.listen.unwrap_or(false);
+    let hosts = if !cli.hosts.is_empty() {
+        cli.hosts.clone()
+    } else {
+        file_cfg.targets.unwrap_or_default()
+    };
+
+    if !listen_mode && hosts.is_empty() {
+        eprintln!("Error: Must specify at least one target host or --listen");
         std::process::exit(1);
     }
 
-    let tos_byte = match &cli.dscp {
+    let port = cli.port.or(file_cfg.port).unwrap_or(DEFAULT_PORT);
+    let metrics_port = cli.metrics_port.or(file_cfg.metrics_port);
+    let interval_sec = cli.interval.or(file_cfg.interval).unwrap_or(1.0);
+    let count = cli.count.or(file_cfg.count);
+    let use_srv = cli.srv || file_cfg.srv.unwrap_or(false);
+    let adaptive = cli.adaptive || file_cfg.adaptive.unwrap_or(false);
+    let dscp_str = cli.dscp.or(file_cfg.dscp);
+
+    let tos_byte = match &dscp_str {
         Some(d) => Some(parse_dscp(d)?),
         None => None,
     };
 
     let enc_method = EncryptMethod::from_str(&cli.encrypt_method)?;
     let digest = AuthDigest::from_str(&cli.auth_digest)?;
-    let security = SecurityConfig::new(
-        cli.auth.as_deref(),
-        digest,
-        cli.encrypt.as_deref(),
-        enc_method,
-    );
 
-    let min_packet_size = cli
-        .packetsize_compat
-        .map(|s| s + 8)
-        .unwrap_or(cli.min_packet_size);
+    // Build SecurityConfig from --keyring, --config keys, or single CLI secrets
+    let security = if let Some(kr_path) = &cli.keyring {
+        let kr = KeyringFile::load(kr_path)?;
+        let active_id = cli.active_key_id.as_deref().or(kr.active_key_id.as_deref());
 
-    let pad_pattern = match &cli.pattern {
-        Some(p) => parse_hex_pattern(p)?,
-        None => Vec::new(),
-    };
-
-    let (bind_addr, target_addr, target_name) = if cli.listen {
-        let addr: SocketAddr = format!("0.0.0.0:{}", cli.port).parse()?;
-        (addr, None, "listener".to_string())
-    } else {
-        let host = cli.host.unwrap();
-        let addr_str = if host.contains(':') {
-            host.clone()
-        } else {
-            format!("{}:{}", host, cli.port)
-        };
-        let resolved: SocketAddr = addr_str
-            .to_socket_addrs()?
-            .next()
-            .ok_or("Unable to resolve target host")?;
-        let local_bind: SocketAddr = if resolved.is_ipv6() {
-            "[::]:0".parse()?
-        } else {
-            "0.0.0.0:0".parse()?
-        };
-        (local_bind, Some(resolved), host)
-    };
-
-    let socket = bind_configured_socket(bind_addr, tos_byte)?;
-
-    let config = EngineConfig {
-        listen_mode: cli.listen,
-        target_addr,
-        target_name,
-        interval: Duration::from_secs_f64(cli.interval.max(0.01)),
-        count: cli.count,
-        min_packet_size,
-        pad_pattern,
-        quiet: cli.quiet,
-        verbose: cli.verbose,
-        three_way: !cli.no_3way,
-        json_output: cli.json,
-        metrics_port: cli.metrics_port,
-        security,
-    };
-
-    run_engine(socket, config).await?;
-    Ok(())
+        SecurityConfig::from_keyring(&kr.keys, active_id, digest, enc_method)?
+} else if !file_cfg.keys.is_empty() {
+let active_id = cli
+.active_key_id
+.as_deref()
+.or(file_cfg.active_key_id.as_deref());
+SecurityConfig::from_keyring(&file_cfg.keys, active_id, digest, enc_method)?
+} else {
+SecurityConfig::new(
+cli.auth.as_deref(),
+digest,
+cli.encrypt.as_deref(),
+enc_method,
+)
+};
+let base_min_size = cli
+.min_packet_size
+.or(file_cfg.min_packet_size)
+.unwrap_or(128);
+let min_packet_size = cli
+.packetsize_compat
+.map(|s| s + 8)
+.unwrap_or(base_min_size);
+let pad_pattern = match &cli.pattern {
+Some(p) => parse_hex_pattern(p)?,
+None => Vec::new(),
+};
+let (bind_port, targets) = if listen_mode {
+(port, Vec::new())
+} else {
+let resolved_targets = resolve_targets(&hosts, port, use_srv).await?;
+(0, resolved_targets)
+};
+let socket = bind_dual_stack_socket(bind_port, tos_byte, cli.mtu_discover)?;
+let config = EngineConfig {
+listen_mode,
+targets,
+interval: Duration::from_secs_f64(interval_sec.max(0.01)),
+count,
+min_packet_size,
+pad_pattern,
+quiet: cli.quiet,
+verbose: cli.verbose,
+three_way: !cli.no_3way,
+json_output: cli.json,
+mtu_discover: cli.mtu_discover,
+tui_mode: cli.tui,
+adaptive,
+metrics_port,
+security,
+};
+run_engine(socket, config).await?;
+Ok(())
 }

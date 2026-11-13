@@ -14,6 +14,9 @@ pub mod opcodes {
     pub const HOST_LATENCY: u16 = 0x0010;
     pub const INVESTIGATE: u16 = 0x0020;
     pub const HMAC: u16 = 0x0040;
+    pub const KEY_ID: u16 = 0x0080;
+    pub const TX_TIMESTAMP_NS: u16 = 0x0100;
+    pub const RX_TIMESTAMP_NS: u16 = 0x0200;
     pub const ENCRYPTED: u16 = 0x8000;
 }
 
@@ -26,6 +29,9 @@ pub struct Packet {
     pub ping_time_us: Option<u32>,
     pub host_latency_us: Option<u32>,
     pub investigate: Vec<[u8; 6]>,
+    pub key_id: Option<String>,
+    pub tx_timestamp_ns: Option<u64>,
+    pub rx_timestamp_ns: Option<u64>,
     pub min_size: usize,
     pub pad_pattern: Vec<u8>,
 }
@@ -97,20 +103,37 @@ impl Packet {
             }
         }
 
+        if let Some(tx_ns) = self.tx_timestamp_ns {
+            flags |= opcodes::TX_TIMESTAMP_NS;
+            data.extend_from_slice(&8u16.to_be_bytes());
+            data.extend_from_slice(&tx_ns.to_be_bytes());
+        }
+
+        if let Some(rx_ns) = self.rx_timestamp_ns {
+            flags |= opcodes::RX_TIMESTAMP_NS;
+            data.extend_from_slice(&8u16.to_be_bytes());
+            data.extend_from_slice(&rx_ns.to_be_bytes());
+        }
+
         (flags, data)
     }
 
     pub fn encode(&self, sec: &SecurityConfig) -> Vec<u8> {
         let (mut flags, mut opcode_data) = self.encode_inner_opcodes();
+        let has_crypto = sec.requires_auth() || sec.requires_encryption();
+        let include_key_id = has_crypto && sec.active_key_id != "default";
 
-        if sec.encrypt_key.is_some() {
+        if sec.requires_encryption() {
             let mut plaintext = Vec::with_capacity(2 + opcode_data.len());
             plaintext.extend_from_slice(&flags.to_be_bytes());
             plaintext.extend_from_slice(&opcode_data);
 
             let mut outer_flags = opcodes::ENCRYPTED;
-            if sec.auth_digest.is_some() {
+            if sec.requires_auth() {
                 outer_flags |= opcodes::HMAC;
+            }
+            if include_key_id {
+                outer_flags |= opcodes::KEY_ID;
             }
             let aad = Self::build_canonical_aad(&self.message_id, outer_flags);
 
@@ -129,25 +152,44 @@ impl Packet {
             opcode_data.extend_from_slice(&encrypted_blob);
         }
 
-        let mut hmac_offset = None;
-        let mut hmac_field_len = 0usize;
-
-        if let Some(digest) = sec.auth_digest {
-            flags |= opcodes::HMAC;
-            hmac_field_len = 1 + digest.tag_len();
-
+        // Insert KEY_ID (0x0080) in ascending bit order (after HMAC 0x0040, before ENCRYPTED 0x8000)
+        if include_key_id {
+            flags |= opcodes::KEY_ID;
+            let kid_bytes = sec.active_key_id.as_bytes();
             let insert_pos = if (flags & opcodes::ENCRYPTED) != 0 {
                 0
             } else {
                 opcode_data.len()
             };
+            let mut kid_tlv = Vec::with_capacity(2 + kid_bytes.len());
+            kid_tlv.extend_from_slice(&(kid_bytes.len() as u16).to_be_bytes());
+            kid_tlv.extend_from_slice(kid_bytes);
+            opcode_data.splice(insert_pos..insert_pos, kid_tlv);
+        }
 
-            let mut hmac_tlv = Vec::with_capacity(2 + hmac_field_len);
-            hmac_tlv.extend_from_slice(&(hmac_field_len as u16).to_be_bytes());
-            hmac_tlv.resize(2 + hmac_field_len, 0x00);
+        // Insert HMAC (0x0040) before KEY_ID (0x0080) and ENCRYPTED (0x8000)
+        let mut hmac_offset = None;
+        let mut hmac_field_len = 0usize;
 
-            opcode_data.splice(insert_pos..insert_pos, hmac_tlv);
-            hmac_offset = Some(MIN_HEADER_LEN + insert_pos + 2);
+        if let Some(digest) = sec.auth_digest {
+            if sec.requires_auth() {
+                flags |= opcodes::HMAC;
+                hmac_field_len = 1 + digest.tag_len();
+
+                let mut hmac_tlv = Vec::with_capacity(2 + hmac_field_len);
+                hmac_tlv.extend_from_slice(&(hmac_field_len as u16).to_be_bytes());
+                hmac_tlv.resize(2 + hmac_field_len, 0x00);
+
+                // HMAC is always the lowest outer TLV bit among {0x0040, 0x0080, 0x8000}
+                let insert_pos = if (flags & (opcodes::KEY_ID | opcodes::ENCRYPTED)) != 0 {
+                    0
+                } else {
+                    opcode_data.len()
+                };
+
+                opcode_data.splice(insert_pos..insert_pos, hmac_tlv);
+                hmac_offset = Some(MIN_HEADER_LEN + insert_pos + 2);
+            }
         }
 
         let mut buf = Vec::with_capacity(self.min_size.max(MIN_HEADER_LEN + opcode_data.len()));
@@ -203,15 +245,16 @@ impl Packet {
         message_id.copy_from_slice(&data[4..10]);
         let outer_flags = u16::from_be_bytes([data, data]);
 
-        if sec.auth_key.is_some() && (outer_flags & opcodes::HMAC) == 0 {
+        if sec.requires_auth() && (outer_flags & opcodes::HMAC) == 0 {
             return Err("Rejected unauthenticated packet (--auth required)");
         }
-        if sec.encrypt_key.is_some() && (outer_flags & opcodes::ENCRYPTED) == 0 {
+        if sec.requires_encryption() && (outer_flags & opcodes::ENCRYPTED) == 0 {
             return Err("Rejected unencrypted packet (--encrypt required)");
         }
 
         let mut cursor = Cursor::new(&data[12..]);
         let mut hmac_span: Option<(usize, Vec<u8>)> = None;
+        let mut key_id_str: Option<String> = None;
         let mut encrypted_blob: Option<Vec<u8>> = None;
         let mut outer_opcodes = Vec::new();
 
@@ -227,62 +270,63 @@ impl Packet {
             }
             let field_len = u16::from_be_bytes(len_bytes) as usize;
             let value_start = MIN_HEADER_LEN + cursor.position() as usize;
-
-            let mut payload = vec![0u8; field_len];
-            if cursor.read_exact(&mut payload).is_err() {
-                return Err("Truncated opcode data");
-            }
-
-            match flag {
-                opcodes::HMAC => {
-                    hmac_span = Some((value_start, payload));
-                }
-                opcodes::ENCRYPTED => {
-                    encrypted_blob = Some(payload);
-                }
-                _ => {
-                    outer_opcodes.push((flag, payload));
-                }
-            }
-        }
-
-        if let Some((offset, tag_bytes)) = hmac_span {
-            if sec.auth_key.is_none() {
-                return Err("Received HMAC packet without --auth key configured");
-            }
-            let mut auth_buf = data.to_vec();
-            auth_buf = 0;
-            auth_buf = 0;
-            for b in &mut auth_buf[offset..offset + tag_bytes.len()] {
-                *b = 0;
-            }
-            if !sec.verify_hmac(&auth_buf, &tag_bytes) {
-                return Err("HMAC authentication failed");
-            }
-        }
-
-        let mut pkt = Packet {
-            message_id,
-            reply_requested: (outer_flags & opcodes::REPLY_REQUESTED) != 0,
-            ..Default::default()
-        };
-
-        if let Some(blob) = encrypted_blob {
-            let aad = Self::build_canonical_aad(&message_id, outer_flags);
-            let plaintext = match sec.encrypt_method {
-                EncryptMethod::ChaCha20Poly1305 => sec.decrypt_chacha20_poly1305(&blob, &aad)?,
-                EncryptMethod::Aes256Cbc => sec.decrypt_aes256_cbc(&blob)?,
-            };
-
-            if plaintext.len() < 2 {
-                return Err("Decrypted payload too short");
-            }
-            let inner_flags = u16::from_be_bytes([plaintext, plaintext]);
-            pkt.reply_requested = (inner_flags & opcodes::REPLY_REQUESTED) != 0;
-
-            let mut inner_cursor = Cursor::new(&plaintext[2..]);
-            for bit in 1..16 {
-                let flag = 1u16 << bit;
+let mut payload = vec![0u8; field_len];
+if cursor.read_exact(&mut payload).is_err() {
+return Err("Truncated opcode data");
+}
+match flag {
+opcodes::HMAC => {
+hmac_span = Some((value_start, payload));
+}
+opcodes::KEY_ID => {
+key_id_str = String::from_utf8(payload).ok();
+}
+opcodes::ENCRYPTED => {
+encrypted_blob = Some(payload);
+}
+_ => {
+outer_opcodes.push((flag, payload));
+}
+}
+}
+if let Some((offset, tag_bytes)) = hmac_span {
+if !sec.requires_auth() {
+return Err("Received HMAC packet without --auth key configured");
+}
+let mut auth_buf = data.to_vec();
+auth_buf = 0;
+auth_buf = 0;
+for b in &mut auth_buf[offset..offset + tag_bytes.len()] {
+*b = 0;
+}
+if !sec.verify_hmac(&auth_buf, &tag_bytes, key_id_str.as_deref()) {
+return Err("HMAC authentication failed");
+}
+}
+let mut pkt = Packet {
+message_id,
+reply_requested: (outer_flags & opcodes::REPLY_REQUESTED) != 0,
+key_id: key_id_str.clone(),
+..Default::default()
+};
+if let Some(blob) = encrypted_blob {
+let aad = Self::build_canonical_aad(&message_id, outer_flags);
+let plaintext = match sec.encrypt_method {
+EncryptMethod::ChaCha20Poly1305 => {
+sec.decrypt_chacha20_poly1305(&blob, &aad, key_id_str.as_deref())?
+}
+EncryptMethod::Aes256Cbc => {
+sec.decrypt_aes256_cbc(&blob, key_id_str.as_deref())?
+}
+};
+if plaintext.len() < 2 {
+return Err("Decrypted payload too short");
+}
+let inner_flags = u16::from_be_bytes([plaintext, plaintext]);
+pkt.reply_requested = (inner_flags & opcodes::REPLY_REQUESTED) != 0;
+let mut inner_cursor = Cursor::new(&plaintext[2..]);
+for bit in 1..16 {
+let flag = 1u16 << bit;
 if (inner_flags & flag) == 0 {
 continue;
 }
@@ -334,6 +378,16 @@ let mut id = [0u8; 6];
 id.copy_from_slice(chunk);
 self.investigate.push(id);
 }
+}
+opcodes::TX_TIMESTAMP_NS if payload.len() >= 8 => {
+self.tx_timestamp_ns = Some(u64::from_be_bytes([
+payload, payload, payload, payload, payload, payload, payload, payload,
+]));
+}
+opcodes::RX_TIMESTAMP_NS if payload.len() >= 8 => {
+self.rx_timestamp_ns = Some(u64::from_be_bytes([
+payload, payload, payload, payload, payload, payload, payload, payload,
+]));
 }
 _ => {}
 }

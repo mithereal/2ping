@@ -1,11 +1,12 @@
 use std::time::Duration;
 use tokio::net::UdpSocket;
+use twoping::config::KeyEntry;
 use twoping::crypto::{AuthDigest, EncryptMethod, SecurityConfig};
-use twoping::engine::{run_engine, EngineConfig};
+use twoping::engine::{run_engine, EngineConfig, TargetSpec};
 use twoping::protocol::{opcodes, Packet, MAGIC_NUMBER};
 
 #[test]
-fn test_plaintext_roundtrip_and_opcodes() {
+fn test_plaintext_roundtrip_and_v1_opcodes() {
     let sec = SecurityConfig::default();
 
     let mut pkt = Packet::new();
@@ -15,11 +16,13 @@ fn test_plaintext_roundtrip_and_opcodes() {
     pkt.ping_time_us = Some(14_250);
     pkt.host_latency_us = Some(320);
     pkt.investigate = vec![[0x01, 0x02, 0x03, 0x04, 0x05, 0x06]];
-    pkt.min_size = 160;
+    pkt.tx_timestamp_ns = Some(1_794_611_520_123_456_789);
+    pkt.rx_timestamp_ns = Some(1_794_611_520_128_987_654);
+    pkt.min_size = 180;
     pkt.pad_pattern = vec![0xDE, 0xAD, 0xBE, 0xEF];
 
     let wire = pkt.encode(&sec);
-    assert_eq!(wire.len(), 160);
+    assert_eq!(wire.len(), 180);
     assert_eq!(u16::from_be_bytes([wire[0], wire[1]]), MAGIC_NUMBER);
 
     let decoded = Packet::decode(&wire, &sec).expect("Valid plaintext packet should decode");
@@ -30,6 +33,8 @@ fn test_plaintext_roundtrip_and_opcodes() {
     assert_eq!(decoded.ping_time_us, Some(14_250));
     assert_eq!(decoded.host_latency_us, Some(320));
     assert_eq!(decoded.investigate, pkt.investigate);
+    assert_eq!(decoded.tx_timestamp_ns, Some(1_794_611_520_123_456_789));
+    assert_eq!(decoded.rx_timestamp_ns, Some(1_794_611_520_128_987_654));
 }
 
 #[test]
@@ -95,6 +100,71 @@ fn test_hmac_authentication_digests_and_tamper_rejection() {
 }
 
 #[test]
+fn test_multi_key_rotation_aead_and_hmac() {
+    let entries = vec![
+        KeyEntry {
+            id: "2026-q3".into(),
+            auth_secret: Some("old-hmac-secret".into()),
+            encrypt_secret: Some("old-chacha-secret".into()),
+        },
+        KeyEntry {
+            id: "2026-q4".into(),
+            auth_secret: Some("new-hmac-secret".into()),
+            encrypt_secret: Some("new-chacha-secret".into()),
+        },
+    ];
+
+    // Listener holds both Q3 and Q4 keys, defaulting to Q4
+    let listener_sec = SecurityConfig::from_keyring(
+        &entries,
+        Some("2026-q4"),
+        AuthDigest::HmacSha256,
+        EncryptMethod::ChaCha20Poly1305,
+    )
+    .unwrap();
+
+    // Client 1 is still sending packets signed/encrypted with Q3
+    let client_q3 = SecurityConfig::from_keyring(
+        &entries,
+        Some("2026-q3"),
+        AuthDigest::HmacSha256,
+        EncryptMethod::ChaCha20Poly1305,
+    )
+    .unwrap();
+
+    let mut pkt = Packet::new();
+    pkt.reply_requested = true;
+    pkt.tx_timestamp_ns = Some(999_888_777);
+
+    let wire = pkt.encode(&client_q3);
+    let outer_flags = u16::from_be_bytes([wire[10], wire[11]]);
+    assert_eq!(
+        outer_flags,
+        opcodes::HMAC | opcodes::KEY_ID | opcodes::ENCRYPTED
+    );
+
+    // Listener decodes Q3 packet seamlessly and identifies the key ID
+    let decoded = Packet::decode(&wire, &listener_sec)
+        .expect("Listener should accept retired Q3 key during rotation");
+    assert_eq!(decoded.key_id.as_deref(), Some("2026-q3"));
+    assert_eq!(decoded.tx_timestamp_ns, Some(999_888_777));
+
+    // A listener that only has Q4 rejects the Q3 packet
+    let q4_only_listener = SecurityConfig::from_keyring(
+        &entries[1..],
+        Some("2026-q4"),
+        AuthDigest::HmacSha256,
+        EncryptMethod::ChaCha20Poly1305,
+    )
+    .unwrap();
+
+    assert_eq!(
+        Packet::decode(&wire, &q4_only_listener).unwrap_err(),
+        "HMAC authentication failed"
+    );
+}
+
+#[test]
 fn test_chacha20_poly1305_aead_and_header_binding() {
     let sec = SecurityConfig::new(
         None,
@@ -143,59 +213,26 @@ fn test_chacha20_poly1305_aead_and_header_binding() {
     );
 }
 
-#[test]
-fn test_aes256_cbc_encryption_and_encrypt_then_mac() {
-    let sec = SecurityConfig::new(
-        Some("hmac-passphrase"),
-        AuthDigest::HmacSha256,
-        Some("aes-encryption-passphrase"),
-        EncryptMethod::Aes256Cbc,
-    );
-    let wrong_enc_sec = SecurityConfig::new(
-        Some("hmac-passphrase"),
-        AuthDigest::HmacSha256,
-        Some("bad-encryption-passphrase"),
-        EncryptMethod::Aes256Cbc,
-    );
-
-    let mut pkt = Packet::new();
-    pkt.reply_requested = true;
-    pkt.in_reply_to = Some([0x99; 6]);
-    pkt.ping_time_us = Some(88_888);
-
-    let wire = pkt.encode(&sec);
-    let outer_flags = u16::from_be_bytes([wire[10], wire[11]]);
-    assert_eq!(outer_flags, opcodes::HMAC | opcodes::ENCRYPTED);
-
-    let decoded = Packet::decode(&wire, &sec).expect("Authenticated + encrypted packet decodes");
-    assert!(decoded.reply_requested);
-    assert_eq!(decoded.in_reply_to, Some([0x99; 6]));
-    assert_eq!(decoded.ping_time_us, Some(88_888));
-
-    assert_eq!(
-        Packet::decode(&wire, &wrong_enc_sec).unwrap_err(),
-        "AES-256-CBC decryption or PKCS7 padding failed"
-    );
-}
-
 #[tokio::test]
-async fn test_end_to_end_aead_3way_loopback() {
-    let listener_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let listener_addr = listener_socket.local_addr().unwrap();
+async fn test_multi_target_aead_3way_loopback() {
+    let listener1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr1 = listener1.local_addr().unwrap();
 
-    let listener_sec = SecurityConfig::new(
+    let listener2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr2 = listener2.local_addr().unwrap();
+
+    let sec = SecurityConfig::new(
         None,
         AuthDigest::HmacSha512,
-        Some("loopback-chacha-key"),
+        Some("multi-target-chacha-key"),
         EncryptMethod::ChaCha20Poly1305,
     );
-    let client_sec = listener_sec.clone();
 
-    let listener_handle = tokio::spawn(async move {
+    let sec1 = sec.clone();
+    let h1 = tokio::spawn(async move {
         let cfg = EngineConfig {
             listen_mode: true,
-            target_addr: None,
-            target_name: "listener".into(),
+            targets: vec![],
             interval: Duration::from_secs(1),
             count: None,
             min_packet_size: 128,
@@ -204,17 +241,50 @@ async fn test_end_to_end_aead_3way_loopback() {
             verbose: false,
             three_way: true,
             json_output: false,
+            mtu_discover: false,
+            tui_mode: false,
+            adaptive: false,
             metrics_port: None,
-            security: listener_sec,
+            security: sec1,
         };
-        let _ = run_engine(listener_socket, cfg).await;
+        let _ = run_engine(listener1, cfg).await;
+    });
+
+    let sec2 = sec.clone();
+    let h2 = tokio::spawn(async move {
+        let cfg = EngineConfig {
+            listen_mode: true,
+            targets: vec![],
+            interval: Duration::from_secs(1),
+            count: None,
+            min_packet_size: 128,
+            pad_pattern: vec![],
+            quiet: true,
+            verbose: false,
+            three_way: true,
+            json_output: false,
+            mtu_discover: false,
+            tui_mode: false,
+            adaptive: false,
+            metrics_port: None,
+            security: sec2,
+        };
+        let _ = run_engine(listener2, cfg).await;
     });
 
     let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let client_cfg = EngineConfig {
         listen_mode: false,
-        target_addr: Some(listener_addr),
-        target_name: "127.0.0.1".into(),
+        targets: vec![
+            TargetSpec {
+                name: "node-alpha".into(),
+                addr: addr1,
+            },
+            TargetSpec {
+                name: "node-beta".into(),
+                addr: addr2,
+            },
+        ],
         interval: Duration::from_millis(50),
         count: Some(3),
         min_packet_size: 128,
@@ -223,8 +293,11 @@ async fn test_end_to_end_aead_3way_loopback() {
         verbose: false,
         three_way: true,
         json_output: false,
+        mtu_discover: false,
+        tui_mode: false,
+        adaptive: false,
         metrics_port: None,
-        security: client_sec,
+        security: sec,
     };
 
     let result = tokio::time::timeout(
@@ -232,28 +305,29 @@ async fn test_end_to_end_aead_3way_loopback() {
         run_engine(client_socket, client_cfg),
     )
     .await
-    .expect("Client should finish within 3 seconds");
+    .expect("Multi-target client should complete within 3 seconds");
 
     assert!(result.is_ok());
-    listener_handle.abort();
+    h1.abort();
+    h2.abort();
 }
 
 fn recompute_ones_complement(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut chunks = data.chunks_exact(2);
     for chunk in &mut chunks {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
-    }
-    if let Some(&rem) = chunks.remainder().first() {
-        sum += (rem as u32) << 8;
-    }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    let res = !(sum as u16);
-    if res == 0 {
-        0xFFFF
-    } else {
-        res
-    }
+sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+}
+if let Some(&rem) = chunks.remainder().first() {
+sum += (rem as u32) << 8;
+}
+while (sum >> 16) != 0 {
+sum = (sum & 0xFFFF) + (sum >> 16);
+}
+let res = !(sum as u16);
+if res == 0 {
+0xFFFF
+} else {
+res
+}
 }

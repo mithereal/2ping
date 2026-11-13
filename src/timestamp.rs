@@ -1,11 +1,23 @@
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::AsRawFd;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::Interest;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 
-/// Enables kernel nanosecond receive timestamps (`SO_TIMESTAMPNS`) on supported Unix targets.
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use tokio::io::Interest;
+
+pub fn now_utc_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
+}
+
 pub fn enable_kernel_timestamps(socket: &UdpSocket) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     unsafe {
@@ -22,15 +34,17 @@ pub fn enable_kernel_timestamps(socket: &UdpSocket) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = socket;
+
     Ok(())
 }
 
-/// Receives a UDP datagram and returns `(bytes_read, peer_addr, monotonic_instant)`.
-/// Uses `recvmsg` + `SCM_TIMESTAMPNS` on Linux to eliminate user-space scheduling jitter.
+/// Receives a UDP datagram and returns `(bytes_read, peer_addr, monotonic_instant, utc_wall_ns)`.
 pub async fn recv_with_timestamp(
     socket: &UdpSocket,
     buf: &mut [u8],
-) -> io::Result<(usize, SocketAddr, Instant)> {
+) -> io::Result<(usize, SocketAddr, Instant, u64)> {
     #[cfg(target_os = "linux")]
     {
         socket
@@ -41,12 +55,15 @@ pub async fn recv_with_timestamp(
     #[cfg(not(target_os = "linux"))]
     {
         let (len, src) = socket.recv_from(buf).await?;
-        Ok((len, src, Instant::now()))
+        Ok((len, src, Instant::now(), now_utc_ns()))
     }
 }
 
 #[cfg(target_os = "linux")]
-fn recvmsg_linux(fd: std::os::fd::RawFd, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, Instant)> {
+fn recvmsg_linux(
+    fd: std::os::fd::RawFd,
+    buf: &mut [u8],
+) -> io::Result<(usize, SocketAddr, Instant, u64)> {
     let mut iov = libc::iovec {
         iov_base: buf.as_mut_ptr() as *mut libc::c_void,
         iov_len: buf.len(),
@@ -56,7 +73,7 @@ fn recvmsg_linux(fd: std::os::fd::RawFd, buf: &mut [u8]) -> io::Result<(usize, S
     let mut cmsg_buf = [0u8; 128];
 
     let mut msghdr: libc::msghdr = unsafe { std::mem::zeroed() };
-    msghdr.msg_name = &mut addr_storage as *mut _ as *mut libc::c_void;
+    msghdr.msg_name = &mut addr_storage as *mut _ as *mut libc::sockaddr_storage as *mut libc::c_void;
     msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     msghdr.msg_iov = &mut iov;
     msghdr.msg_iovlen = 1;
@@ -71,8 +88,8 @@ fn recvmsg_linux(fd: std::os::fd::RawFd, buf: &mut [u8]) -> io::Result<(usize, S
     let now_instant = Instant::now();
     let now_sys = SystemTime::now();
     let mut recv_instant = now_instant;
+    let mut wall_ns = now_utc_ns();
 
-    // Parse ancillary control messages for SCM_TIMESTAMPNS
     unsafe {
         let mut cmsg = libc::CMSG_FIRSTHDR(&msghdr);
         while !cmsg.is_null() {
@@ -81,10 +98,15 @@ fn recvmsg_linux(fd: std::os::fd::RawFd, buf: &mut [u8]) -> io::Result<(usize, S
                 let ts_ptr = libc::CMSG_DATA(cmsg) as *const libc::timespec;
                 let ts = *ts_ptr;
                 if ts.tv_sec >= 0 && ts.tv_nsec >= 0 {
-                    let kernel_wall = UNIX_EPOCH
-                        + Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32);
+                    let kernel_wall =
+                        UNIX_EPOCH + Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32);
+                    wall_ns = kernel_wall
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                        .min(u64::MAX as u128) as u64;
+
                     if let Ok(delta) = now_sys.duration_since(kernel_wall) {
-                        // Reconstruct monotonic Instant at exact kernel packet arrival
                         if delta < Duration::from_secs(5) {
                             recv_instant = now_instant - delta;
                         }
@@ -97,7 +119,7 @@ fn recvmsg_linux(fd: std::os::fd::RawFd, buf: &mut [u8]) -> io::Result<(usize, S
     }
 
     let peer = sockaddr_to_std(&addr_storage, msghdr.msg_namelen)?;
-    Ok((n as usize, peer, recv_instant))
+    Ok((n as usize, peer, recv_instant, wall_ns))
 }
 
 #[cfg(target_os = "linux")]

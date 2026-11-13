@@ -1,0 +1,19 @@
+# Declarative fleet configuration & zero-downtime key rotation keyring
+port = 15998
+metrics_port = 9100
+interval = 1.0
+dscp = "EF"
+adaptive = true
+targets = ["10.0.0.5", "10.0.0.12"]
+
+# Zero-downtime multi-key rotation:
+# Listeners accept any key in [[keys]]; clients sign/encrypt using active_key_id.
+active_key_id = "2026-q4"
+
+[[keys]]
+id = "2026-q3"
+encrypt_secret = "previous-quarter-secret-key"
+
+[[keys]]
+id = "2026-q4"
+encrypt_secret = "current-quarter-secret-key"

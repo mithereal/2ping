@@ -6,14 +6,16 @@ services:
     container_name: 2ping-listener
     command:
       - "--listen"
-      - "--auth"
-      - "${TWOPING_AUTH_SECRET:-change-me-hmac-secret}"
-      - "--auth-digest"
-      - "hmac-sha512"
+      - "--metrics-port"
+      - "9100"
       - "--encrypt"
-      - "${TWOPING_ENCRYPT_SECRET:-change-me-aes-secret}"
+      - "${TWOPING_ENCRYPT_SECRET:-change-me-aead-secret}"
     ports:
       - "15998:15998/udp"
+      - "9100:9100/tcp"
+    # Optional: mount a keyring or fleet config file
+    # volumes:
+    #   - ./2ping.example.toml:/etc/2ping/2ping.toml:ro
     networks:
       - twoping-net
     restart: unless-stopped
@@ -29,15 +31,32 @@ services:
       - "listener"
       - "-c"
       - "10"
-      - "--auth"
-      - "${TWOPING_AUTH_SECRET:-change-me-hmac-secret}"
-      - "--auth-digest"
-      - "hmac-sha512"
+      - "--dscp"
+      - "EF"
       - "--encrypt"
-      - "${TWOPING_ENCRYPT_SECRET:-change-me-aes-secret}"
+      - "${TWOPING_ENCRYPT_SECRET:-change-me-aead-secret}"
+    networks:
+      - twoping-net
+
+  tui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: 2ping-tui
+    profiles: ["tui"]
+    stdin_open: true
+    tty: true
+    depends_on:
+      - listener
+    command:
+      - "listener"
+      - "--tui"
+      - "--encrypt"
+      - "${TWOPING_ENCRYPT_SECRET:-change-me-aead-secret}"
     networks:
       - twoping-net
 
 networks:
   twoping-net:
     driver: bridge
+    enable_ipv6: true

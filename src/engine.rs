@@ -1,8 +1,9 @@
 use crate::crypto::SecurityConfig;
 use crate::protocol::{hex_id, Packet};
-use crate::timestamp::{enable_kernel_timestamps, recv_with_timestamp};
+use crate::timestamp::{enable_kernel_timestamps, now_utc_ns, recv_with_timestamp};
+use crate::tui::run_tui_loop;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,23 +14,39 @@ use tokio::time;
 
 const REPLAY_TTL: Duration = Duration::from_secs(30);
 const REPLAY_MAX_ENTRIES: usize = 10_000;
+const STATS_WINDOW_CAP: usize = 10_000;
+
+#[derive(Debug, Clone)]
+pub struct TargetSpec {
+    pub name: String,
+    pub addr: SocketAddr,
+}
 
 #[derive(Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum JsonEvent<'a> {
     Reply {
+        target: &'a str,
         peer: String,
         bytes: usize,
         seq: u64,
         rtt_ms: f64,
         raw_rtt_ms: f64,
         host_latency_ms: Option<f64>,
+        outbound_owd_ms: Option<f64>,
+        inbound_owd_ms: Option<f64>,
         jitter_ms: f64,
     },
     PacketLoss {
+        target: &'a str,
         direction: &'a str,
         peer: String,
         seq: u64,
+    },
+    MtuResult {
+        target: &'a str,
+        peer: String,
+        discovered_mtu_bytes: usize,
     },
     Summary {
         target: &'a str,
@@ -47,6 +64,8 @@ enum JsonEvent<'a> {
         rtt_p50_ms: Option<f64>,
         rtt_p95_ms: Option<f64>,
         rtt_p99_ms: Option<f64>,
+        outbound_owd_avg_ms: Option<f64>,
+        inbound_owd_avg_ms: Option<f64>,
         jitter_ms: f64,
         peer_processing_avg_ms: Option<f64>,
         raw_tx: u64,
@@ -57,8 +76,10 @@ enum JsonEvent<'a> {
 
 #[derive(Debug, Clone)]
 struct SentRecord {
+    target_name: String,
     seq: Option<u64>,
     sent_at: Instant,
+    tx_wall_ns: u64,
     peer: SocketAddr,
     is_first_leg: bool,
     acked: bool,
@@ -97,11 +118,12 @@ impl ReplayCache {
 }
 
 #[derive(Default)]
-struct State {
+pub struct State {
     sent_packets: HashMap<[u8; 6], SentRecord>,
     courtesy_queue: HashMap<SocketAddr, Vec<[u8; 6]>>,
     replay_cache: ReplayCache,
-    stats: Stats,
+    pub per_target_stats: HashMap<String, Stats>,
+    pub global_stats: Stats,
 }
 
 #[derive(Default, Clone)]
@@ -111,8 +133,10 @@ pub struct Stats {
     pub outbound_loss: u64,
     pub inbound_loss: u64,
     pub undetermined_loss: u64,
-    pub rtts_ms: Vec<f64>,
-    pub host_latencies_ms: Vec<f64>,
+    pub rtts_ms: VecDeque<f64>,
+    pub host_latencies_ms: VecDeque<f64>,
+    pub outbound_owds_ms: VecDeque<f64>,
+    pub inbound_owds_ms: VecDeque<f64>,
     pub jitter_ms: f64,
     pub prev_rtt_ms: Option<f64>,
     pub raw_tx: u64,
@@ -121,17 +145,41 @@ pub struct Stats {
 }
 
 impl Stats {
-    pub fn record_rtt(&mut self, net_rtt_ms: f64, host_lat_ms: Option<f64>) {
+    pub fn record_rtt(
+        &mut self,
+        net_rtt_ms: f64,
+        host_lat_ms: Option<f64>,
+        out_owd_ms: Option<f64>,
+        in_owd_ms: Option<f64>,
+    ) {
         if let Some(prev) = self.prev_rtt_ms {
             let diff = (net_rtt_ms - prev).abs();
             self.jitter_ms += (diff - self.jitter_ms) / 16.0;
         }
         self.prev_rtt_ms = Some(net_rtt_ms);
-        self.rtts_ms.push(net_rtt_ms);
 
+        push_bounded(&mut self.rtts_ms, net_rtt_ms);
         if let Some(h_ms) = host_lat_ms {
-            self.host_latencies_ms.push(h_ms);
+            push_bounded(&mut self.host_latencies_ms, h_ms);
         }
+        if let Some(o_ms) = out_owd_ms {
+            push_bounded(&mut self.outbound_owds_ms, o_ms);
+        }
+        if let Some(i_ms) = in_owd_ms {
+            push_bounded(&mut self.inbound_owds_ms, i_ms);
+        }
+    }
+
+    pub fn avg_rtt(&self) -> f64 {
+        mean_deque(&self.rtts_ms).unwrap_or(0.0)
+    }
+
+    pub fn avg_outbound_owd(&self) -> Option<f64> {
+        mean_deque(&self.outbound_owds_ms)
+    }
+
+    pub fn avg_inbound_owd(&self) -> Option<f64> {
+        mean_deque(&self.inbound_owds_ms)
     }
 
     pub fn print_summary(&self, target: &str, elapsed: Duration, json_output: bool) {
@@ -143,7 +191,7 @@ impl Stats {
         };
 
         let rtt_metrics = if !self.rtts_ms.is_empty() {
-            let mut sorted = self.rtts_ms.clone();
+            let mut sorted: Vec<f64> = self.rtts_ms.iter().copied().collect();
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
             let min = sorted;
@@ -170,14 +218,9 @@ impl Stats {
             None
         };
 
-        let avg_host = if !self.host_latencies_ms.is_empty() {
-            Some(
-                self.host_latencies_ms.iter().sum::<f64>()
-                    / (self.host_latencies_ms.len() as f64),
-            )
-        } else {
-            None
-        };
+        let avg_host = mean_deque(&self.host_latencies_ms);
+        let avg_out_owd = self.avg_outbound_owd();
+        let avg_in_owd = self.avg_inbound_owd();
 
         if json_output {
             let (min, avg, max, mdev, p50, p95, p99) = match rtt_metrics {
@@ -209,6 +252,8 @@ impl Stats {
                 rtt_p50_ms: p50,
                 rtt_p95_ms: p95,
                 rtt_p99_ms: p99,
+                outbound_owd_avg_ms: avg_out_owd.map(round3),
+                inbound_owd_avg_ms: avg_in_owd.map(round3),
                 jitter_ms: round3(self.jitter_ms),
                 peer_processing_avg_ms: avg_host.map(round3),
                 raw_tx: self.raw_tx,
@@ -253,109 +298,162 @@ impl Stats {
                 p50, p95, p99
             );
         }
+        if let (Some(o_owd), Some(i_owd)) = (avg_out_owd, avg_in_owd) {
+            println!(
+                "one-way delay (OWD) avg: outbound = {:.3} ms, inbound = {:.3} ms",
+                o_owd, i_owd
+            );
+        }
         if let Some(h_avg) = avg_host {
             println!(
                 "peer processing latency avg = {:.3} ms (subtracted from rtt)",
                 h_avg
-            );
-        }
-        println!(
-            "{} raw packets transmitted, {} received ({} dropped/invalid)",
-            self.raw_tx, self.raw_rx, self.auth_or_decrypt_errors
-        );
-    }
+);
 }
-
-fn round3(v: f64) -> f64 {
-    (v * 1000.0).round() / 1000.0
-}
-
-fn percentile(sorted: &[f64], pct: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    if sorted.len() == 1 {
-        return sorted;
-    }
-    let rank = (pct / 100.0) * ((sorted.len() - 1) as f64);
-    let lower = rank.floor() as usize;
-    let upper = rank.ceil() as usize;
-    let weight = rank - (lower as f64);
-    sorted[lower] * (1.0 - weight) + sorted[upper] * weight
-}
-
-pub struct EngineConfig {
-    pub listen_mode: bool,
-    pub target_addr: Option<SocketAddr>,
-    pub target_name: String,
-    pub interval: Duration,
-    pub count: Option<u64>,
-    pub min_packet_size: usize,
-    pub pad_pattern: Vec<u8>,
-    pub quiet: bool,
-    pub verbose: bool,
-    pub three_way: bool,
-    pub json_output: bool,
-    pub metrics_port: Option<u16>,
-    pub security: SecurityConfig,
-}
-
-pub async fn run_engine(socket: UdpSocket, config: EngineConfig) -> std::io::Result<()> {
-    let _ = enable_kernel_timestamps(&socket);
-
-    let socket = Arc::new(socket);
-    let state = Arc::new(Mutex::new(State::default()));
-    let security = Arc::new(config.security);
-    let start_time = Instant::now();
-
-    if !config.json_output {
-        if config.listen_mode {
-            println!("2PING listener bound to {}", socket.local_addr()?);
-        } else if let Some(addr) = config.target_addr {
-            println!(
-                "2PING {} ({}): {} bytes of data.",
-config.target_name, addr, config.min_packet_size
+println!(
+"{} raw packets transmitted, {} received ({} dropped/invalid)",
+self.raw_tx, self.raw_rx, self.auth_or_decrypt_errors
 );
 }
 }
-// Optional Prometheus /metrics HTTP exporter
+fn push_bounded(q: &mut VecDeque, val: f64) {
+if q.len() >= STATS_WINDOW_CAP {
+q.pop_front();
+}
+q.push_back(val);
+}
+fn mean_deque(q: &VecDeque) -> Option {
+if q.is_empty() {
+None
+} else {
+Some(q.iter().sum::() / (q.len() as f64))
+}
+}
+fn round3(v: f64) -> f64 {
+(v * 1000.0).round() / 1000.0
+}
+fn percentile(sorted: &[f64], pct: f64) -> f64 {
+if sorted.is_empty() {
+return 0.0;
+}
+if sorted.len() == 1 {
+return sorted;
+}
+let rank = (pct / 100.0) * ((sorted.len() - 1) as f64);
+let lower = rank.floor() as usize;
+let upper = rank.ceil() as usize;
+let weight = rank - (lower as f64);
+sorted[lower] * (1.0 - weight) + sorted[upper] * weight
+}
+pub struct EngineConfig {
+pub listen_mode: bool,
+pub targets: Vec,
+pub interval: Duration,
+pub count: Option,
+pub min_packet_size: usize,
+pub pad_pattern: Vec,
+pub quiet: bool,
+pub verbose: bool,
+pub three_way: bool,
+pub json_output: bool,
+pub mtu_discover: bool,
+pub tui_mode: bool,
+pub adaptive: bool,
+pub metrics_port: Option,
+pub security: SecurityConfig,
+}
+pub async fn run_engine(socket: UdpSocket, config: EngineConfig) -> std::io::Result<()> {
+let _ = enable_kernel_timestamps(&socket);
+let socket = Arc::new(socket);
+let state = Arc::new(Mutex::new(State::default()));
+let active_key_id = config.security.active_key_id.clone();
+let security = Arc::new(config.security);
+let start_time = Instant::now();
+let suppress_stdout = config.quiet || config.tui_mode;
+if !config.json_output && !config.tui_mode {
+if config.listen_mode {
+println!(
+"2PING dual-stack listener bound to {} (active key: {})",
+socket.local_addr()?,
+active_key_id
+);
+} else {
+for t in &config.targets {
+println!(
+"2PING {} ({}): {} bytes of data.",
+t.name, t.addr, config.min_packet_size
+);
+}
+}
+}
+// Prometheus /metrics HTTP exporter with OWD and directional loss labels
 if let Some(m_port) = config.metrics_port {
 let m_state = Arc::clone(&state);
 tokio::spawn(async move {
-if let Ok(listener) = TcpListener::bind(("0.0.0.0", m_port)).await {
+if let Ok(listener) = TcpListener::bind(("::", m_port)).await {
 while let Ok((mut stream, _)) = listener.accept().await {
-let snapshot = {
+let (global, per_target) = {
 let st = m_state.lock().await;
-st.stats.clone()
+(st.global_stats.clone(), st.per_target_stats.clone())
 };
-let avg_rtt = if snapshot.rtts_ms.is_empty() {
-0.0
-} else {
-snapshot.rtts_ms.iter().sum::() / (snapshot.rtts_ms.len() as f64)
-};
-let body = format!(
-"# TYPE twoping_pings_transmitted_total counter\n
-twoping_pings_transmitted_total {}\n
-# TYPE twoping_pings_received_total counter\n
-twoping_pings_received_total {}\n
-# TYPE twoping_outbound_loss_total counter\n
-twoping_outbound_loss_total {}\n
-# TYPE twoping_inbound_loss_total counter\n
-twoping_inbound_loss_total {}\n
-# TYPE twoping_dropped_invalid_total counter\n
+let mut body = format!(
+"# TYPE twoping_dropped_invalid_total counter\n
 twoping_dropped_invalid_total {}\n
+# TYPE twoping_pings_transmitted_total counter\n
+# TYPE twoping_pings_received_total counter\n
+# TYPE twoping_outbound_loss_total counter\n
+# TYPE twoping_inbound_loss_total counter\n
 # TYPE twoping_rtt_avg_ms gauge\n
-twoping_rtt_avg_ms {:.3}\n
-# TYPE twoping_jitter_ms gauge\n
-twoping_jitter_ms {:.3}\n",
-snapshot.pings_transmitted,
-snapshot.pings_received,
-snapshot.outbound_loss,
-snapshot.inbound_loss,
-snapshot.auth_or_decrypt_errors,
-avg_rtt,
-snapshot.jitter_ms
+# TYPE twoping_outbound_owd_avg_ms gauge\n
+# TYPE twoping_inbound_owd_avg_ms gauge\n
+# TYPE twoping_jitter_ms gauge\n",
+global.auth_or_decrypt_errors
 );
+if per_target.is_empty() {
+body.push_str(&format!(
+"twoping_pings_transmitted_total{{target="listener"}} {}\n
+twoping_pings_received_total{{target="listener"}} {}\n
+twoping_outbound_loss_total{{target="listener"}} {}\n
+twoping_inbound_loss_total{{target="listener"}} {}\n
+twoping_rtt_avg_ms{{target="listener"}} {:.3}\n
+twoping_jitter_ms{{target="listener"}} {:.3}\n",
+global.pings_transmitted,
+global.pings_received,
+global.outbound_loss,
+global.inbound_loss,
+global.avg_rtt(),
+global.jitter_ms
+));
+} else {
+for (t_name, s) in &per_target {
+body.push_str(&format!(
+"twoping_pings_transmitted_total{{target="{}"}} {}\n
+twoping_pings_received_total{{target="{}"}} {}\n
+twoping_outbound_loss_total{{target="{}"}} {}\n
+twoping_inbound_loss_total{{target="{}"}} {}\n
+twoping_rtt_avg_ms{{target="{}"}} {:.3}\n
+twoping_outbound_owd_avg_ms{{target="{}"}} {:.3}\n
+twoping_inbound_owd_avg_ms{{target="{}"}} {:.3}\n
+twoping_jitter_ms{{target="{}"}} {:.3}\n",
+t_name,
+s.pings_transmitted,
+t_name,
+s.pings_received,
+t_name,
+s.outbound_loss,
+t_name,
+s.inbound_loss,
+t_name,
+s.avg_rtt(),
+t_name,
+s.avg_outbound_owd().unwrap_or(0.0),
+t_name,
+s.avg_inbound_owd().unwrap_or(0.0),
+t_name,
+s.jitter_ms
+));
+}
+}
 let resp = format!(
 "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
 body.len(),
@@ -366,52 +464,66 @@ let _ = stream.write_all(resp.as_bytes()).await;
 }
 });
 }
-// Background UDP receiver task with kernel timestamp support
+// Background UDP receiver task
 let rx_socket = Arc::clone(&socket);
 let rx_state = Arc::clone(&state);
 let rx_sec = Arc::clone(&security);
-let quiet = config.quiet;
 let verbose = config.verbose;
 let three_way = config.three_way;
 let json_output = config.json_output;
 let min_size = config.min_packet_size;
 let pattern = config.pad_pattern.clone();
+let multi_target = config.targets.len() > 1;
 tokio::spawn(async move {
 let mut buf = vec![0u8; 65535];
-while let Ok((len, src, recv_time)) = recv_with_timestamp(&rx_socket, &mut buf).await {
+while let Ok((len, src, recv_time, recv_wall_ns)) =
+recv_with_timestamp(&rx_socket, &mut buf).await
+{
 let mut st = rx_state.lock().await;
 let pkt = match Packet::decode(&buf[..len], &rx_sec) {
 Ok(p) => p,
 Err(e) => {
-st.stats.auth_or_decrypt_errors += 1;
-if verbose && !json_output {
+st.global_stats.auth_or_decrypt_errors += 1;
+if verbose && !json_output && !suppress_stdout {
 eprintln!("Dropped invalid packet from {}: {}", src, e);
 }
 continue;
 }
 };
 if !st.replay_cache.check_and_insert(src, pkt.message_id, recv_time) {
-st.stats.auth_or_decrypt_errors += 1;
-if verbose && !json_output {
+st.global_stats.auth_or_decrypt_errors += 1;
+if verbose && !json_output && !suppress_stdout {
 eprintln!("Dropped replayed packet id={} from {}", pkt.id_hex(), src);
 }
 continue;
 }
-st.stats.raw_rx += 1;
-if verbose && !json_output {
+st.global_stats.raw_rx += 1;
+if verbose && !json_output && !suppress_stdout {
 println!(
-"RX from {} id={} reply_req={} in_reply_to={:?} host_lat_us={:?}",
+"RX from {} id={} key={:?} reply_req={} in_reply_to={:?} host_lat_us={:?}",
 src,
 pkt.id_hex(),
+pkt.key_id,
 pkt.reply_requested,
 pkt.in_reply_to.as_ref().map(hex_id),
 pkt.host_latency_us
 );
 }
 if let Some(reply_id) = pkt.in_reply_to {
-if let Some(rec) = st.sent_packets.get_mut(&reply_id) {
+let matched = if let Some(rec) = st.sent_packets.get_mut(&reply_id) {
 rec.acked = true;
-let raw_rtt = recv_time.duration_since(rec.sent_at);
+Some((
+rec.target_name.clone(),
+rec.sent_at,
+rec.tx_wall_ns,
+rec.is_first_leg,
+rec.seq.unwrap_or(0),
+))
+} else {
+None
+};
+if let Some((t_name, sent_at, client_tx_ns, is_first_leg, seq_num)) = matched {
+let raw_rtt = recv_time.duration_since(sent_at);
 let raw_rtt_ms = raw_rtt.as_secs_f64() * 1000.0;
 let (net_rtt_ms, host_lat_ms) = match pkt.host_latency_us {
 Some(us) => {
@@ -420,33 +532,61 @@ let h_ms = (us as f64) / 1000.0;
 }
 None => (raw_rtt_ms, None),
 };
-if rec.is_first_leg {
-let seq_num = rec.seq.unwrap_or(0);
-st.stats.pings_received += 1;
-st.stats.record_rtt(net_rtt_ms, host_lat_ms);
-if !quiet {
+// Compute clock-synchronized One-Way Delays (outbound & inbound)
+let (out_owd_ms, in_owd_ms) = match (pkt.rx_timestamp_ns, pkt.tx_timestamp_ns) {
+(Some(listener_rx_ns), Some(listener_tx_ns))
+if listener_rx_ns >= client_tx_ns && recv_wall_ns >= listener_tx_ns =>
+{
+let out_ms = (listener_rx_ns - client_tx_ns) as f64 / 1_000_000.0;
+let in_ms = (recv_wall_ns - listener_tx_ns) as f64 / 1_000_000.0;
+(Some(out_ms), Some(in_ms))
+}
+_ => (None, None),
+};
+if is_first_leg {
+st.global_stats.pings_received += 1;
+st.global_stats
+.record_rtt(net_rtt_ms, host_lat_ms, out_owd_ms, in_owd_ms);
+let t_stats = st.per_target_stats.entry(t_name.clone()).or_default();
+t_stats.pings_received += 1;
+t_stats.raw_rx += 1;
+t_stats.record_rtt(net_rtt_ms, host_lat_ms, out_owd_ms, in_owd_ms);
+let cur_jitter = t_stats.jitter_ms;
+if !suppress_stdout {
 if json_output {
 let ev = JsonEvent::Reply {
+target: &t_name,
 peer: src.to_string(),
 bytes: len,
 seq: seq_num,
 rtt_ms: round3(net_rtt_ms),
 raw_rtt_ms: round3(raw_rtt_ms),
 host_latency_ms: host_lat_ms.map(round3),
-jitter_ms: round3(st.stats.jitter_ms),
+outbound_owd_ms: out_owd_ms.map(round3),
+inbound_owd_ms: in_owd_ms.map(round3),
+jitter_ms: round3(cur_jitter),
 };
 if let Ok(line) = serde_json::to_string(&ev) {
 println!("{}", line);
 }
 } else {
-match host_lat_ms {
-Some(h_ms) if h_ms > 0.001 => println!(
+let label = if multi_target {
+format!("{} ({})", t_name, src)
+} else {
+src.to_string()
+};
+match (host_lat_ms, out_owd_ms, in_owd_ms) {
+(_, Some(o), Some(i)) => println!(
+"{} bytes from {}: ping_seq={} time={:.3} ms (owd out={:.3} ms, in={:.3} ms)",
+len, label, seq_num, net_rtt_ms, o, i
+),
+(Some(h_ms), _, _) if h_ms > 0.001 => println!(
 "{} bytes from {}: ping_seq={} time={:.3} ms (raw={:.3} ms, host={:.3} ms)",
-len, src, seq_num, net_rtt_ms, raw_rtt_ms, h_ms
+len, label, seq_num, net_rtt_ms, raw_rtt_ms, h_ms
 ),
 _ => println!(
 "{} bytes from {}: ping_seq={} time={:.3} ms",
-len, src, seq_num, net_rtt_ms
+len, label, seq_num, net_rtt_ms
 ),
 }
 }
@@ -459,13 +599,25 @@ for expired_id in &pkt.courtesy_expires {
 st.sent_packets.remove(expired_id);
 }
 for inv_id in &pkt.investigate {
-if let Some(rec) = st.sent_packets.get(inv_id) {
+let lost_info = if let Some(rec) = st.sent_packets.get(inv_id) {
 if !rec.acked && rec.is_first_leg {
-st.stats.inbound_loss += 1;
-if !quiet {
-let seq_num = rec.seq.unwrap_or(0);
+Some((rec.target_name.clone(), rec.seq.unwrap_or(0)))
+} else {
+None
+}
+} else {
+None
+};
+if let Some((t_name, seq_num)) = lost_info {
+st.global_stats.inbound_loss += 1;
+st.per_target_stats
+.entry(t_name.clone())
+.or_default()
+.inbound_loss += 1;
+if !suppress_stdout {
 if json_output {
 let ev = JsonEvent::PacketLoss {
+target: &t_name,
 direction: "inbound",
 peer: src.to_string(),
 seq: seq_num,
@@ -479,19 +631,21 @@ println!("Lost inbound packet from {}: ping_seq={}", src, seq_num);
 }
 }
 }
-}
 if pkt.reply_requested {
 let mut reply = Packet::new();
 reply.min_size = min_size;
 reply.pad_pattern = pattern.clone();
 reply.in_reply_to = Some(pkt.message_id);
+reply.rx_timestamp_ns = Some(recv_wall_ns);
 if three_way && pkt.in_reply_to.is_none() {
 reply.reply_requested = true;
 st.sent_packets.insert(
 reply.message_id,
 SentRecord {
+target_name: "listener".into(),
 seq: None,
 sent_at: Instant::now(),
+tx_wall_ns: now_utc_ns(),
 peer: src,
 is_first_leg: false,
 acked: false,
@@ -503,16 +657,16 @@ reply.courtesy_expires = courtesy;
 }
 let processing_us = recv_time.elapsed().as_micros().min(u32::MAX as u128) as u32;
 reply.host_latency_us = Some(processing_us);
+reply.tx_timestamp_ns = Some(now_utc_ns());
 let wire = reply.encode(&rx_sec);
 if rx_socket.send_to(&wire, src).await.is_ok() {
-st.stats.raw_tx += 1;
+st.global_stats.raw_tx += 1;
 }
 }
 }
 });
 // Background garbage collector and outbound loss analyzer
 let gc_state = Arc::clone(&state);
-let gc_quiet = config.quiet;
 let gc_json = config.json_output;
 tokio::spawn(async move {
 let mut ticker = time::interval(Duration::from_secs(1));
@@ -522,30 +676,39 @@ let mut st = gc_state.lock().await;
 let now = Instant::now();
 st.replay_cache.evict_expired(now);
 let mut expired_keys = Vec::new();
+let mut outbound_losses = Vec::new();
 for (id, rec) in &st.sent_packets {
 if now.duration_since(rec.sent_at) > Duration::from_secs(10) {
 if !rec.acked && rec.is_first_leg {
-st.stats.outbound_loss += 1;
-if !gc_quiet {
-let seq_num = rec.seq.unwrap_or(0);
+outbound_losses.push((
+rec.target_name.clone(),
+rec.peer,
+rec.seq.unwrap_or(0),
+));
+}
+expired_keys.push(*id);
+}
+}
+for (t_name, peer, seq_num) in outbound_losses {
+st.global_stats.outbound_loss += 1;
+st.per_target_stats
+.entry(t_name.clone())
+.or_default()
+.outbound_loss += 1;
+if !suppress_stdout {
 if gc_json {
 let ev = JsonEvent::PacketLoss {
+target: &t_name,
 direction: "outbound",
-peer: rec.peer.to_string(),
+peer: peer.to_string(),
 seq: seq_num,
 };
 if let Ok(line) = serde_json::to_string(&ev) {
 println!("{}", line);
 }
 } else {
-println!(
-"Lost outbound packet to {}: ping_seq={}",
-rec.peer, seq_num
-);
+println!("Lost outbound packet to {}: ping_seq={}", peer, seq_num);
 }
-}
-}
-expired_keys.push(*id);
 }
 }
 for k in expired_keys {
@@ -553,33 +716,74 @@ st.sent_packets.remove(&k);
 }
 }
 });
-// Client ping loop or listener Ctrl-C wait
+// Spawn interactive TUI if requested
+let tui_handle = if config.tui_mode {
+let tui_state = Arc::clone(&state);
+let tui_kid = active_key_id.clone();
+Some(tokio::spawn(async move {
+let _ = run_tui_loop(tui_state, tui_kid).await;
+}))
+} else {
+None
+};
+// Execution modes: Listener, Path MTU Discovery, or Multi-Target Client Loop
 if config.listen_mode {
+if let Some(handle) = tui_handle {
+let _ = handle.await;
+} else {
 tokio::signal::ctrl_c().await?;
-} else if let Some(target) = config.target_addr {
+}
+} else if config.mtu_discover {
+run_mtu_discovery(&socket, &state, &security, &config).await?;
+} else {
 let mut seq = 1u64;
-let mut ticker = time::interval(config.interval);
+let base_interval = config.interval;
 loop {
+// Adaptive backoff: double interval (up to 10s) when packet loss exceeds 20%
+let current_interval = if config.adaptive {
+let st = state.lock().await;
+let tx = st.global_stats.pings_transmitted;
+let rx = st.global_stats.pings_received;
+if tx > 5 && (rx as f64 / tx as f64) < 0.80 {
+(base_interval * 2).min(Duration::from_secs(10))
+} else {
+base_interval
+}
+} else {
+base_interval
+};
+let tui_exited = tui_handle.as_ref().map(|h| h.is_finished()).unwrap_or(false);
+if tui_exited {
+break;
+}
 tokio::select! {
-_ = ticker.tick() => {
+_ = time::sleep(current_interval) => {
 if let Some(max) = config.count {
 if seq > max {
 time::sleep(Duration::from_millis(500)).await;
 break;
 }
 }
+for target in &config.targets {
 let mut pkt = Packet::new();
 pkt.reply_requested = true;
 pkt.min_size = config.min_packet_size;
 pkt.pad_pattern = config.pad_pattern.clone();
+let tx_wall_ns = now_utc_ns();
+pkt.tx_timestamp_ns = Some(tx_wall_ns);
 {
 let mut st = state.lock().await;
-if let Some(courtesy) = st.courtesy_queue.remove(&target) {
+if let Some(courtesy) = st.courtesy_queue.remove(&target.addr) {
 pkt.courtesy_expires = courtesy;
 }
 let unacked: Vec<[u8; 6]> = st.sent_packets
 .iter()
-.filter(|(_, r)| !r.acked && !r.is_first_leg && r.sent_at.elapsed() > Duration::from_secs(2))
+.filter(|(_, r)| {
+!r.acked
+&& !r.is_first_leg
+&& r.peer == target.addr
+&& r.sent_at.elapsed() > Duration::from_secs(2)
+})
 .map(|(id, _)| *id)
 .take(4)
 .collect();
@@ -587,18 +791,24 @@ pkt.investigate = unacked;
 st.sent_packets.insert(
 pkt.message_id,
 SentRecord {
+target_name: target.name.clone(),
 seq: Some(seq),
 sent_at: Instant::now(),
-peer: target,
+tx_wall_ns,
+peer: target.addr,
 is_first_leg: true,
 acked: false,
 },
 );
-st.stats.pings_transmitted += 1;
-st.stats.raw_tx += 1;
+st.global_stats.pings_transmitted += 1;
+st.global_stats.raw_tx += 1;
+let t_stats = st.per_target_stats.entry(target.name.clone()).or_default();
+t_stats.pings_transmitted += 1;
+t_stats.raw_tx += 1;
 }
 let wire = pkt.encode(&security);
-socket.send_to(&wire, target).await?;
+socket.send_to(&wire, target.addr).await?;
+}
 seq += 1;
 }
 _ = tokio::signal::ctrl_c() => {
@@ -607,8 +817,106 @@ break;
 }
 }
 }
+if let Some(handle) = tui_handle {
+handle.abort();
+}
 let st = state.lock().await;
-st.stats
-.print_summary(&config.target_name, start_time.elapsed(), config.json_output);
+if config.listen_mode {
+st.global_stats
+.print_summary("listener", start_time.elapsed(), config.json_output);
+} else {
+for t in &config.targets {
+let stats = st
+.per_target_stats
+.get(&t.name)
+.cloned()
+.unwrap_or_default();
+stats.print_summary(&t.name, start_time.elapsed(), config.json_output);
+}
+}
+Ok(())
+}
+async fn run_mtu_discovery(
+socket: &UdpSocket,
+state: &Arc<Mutex>,
+security: &Arc,
+config: &EngineConfig,
+) -> std::io::Result<()> {
+for target in &config.targets {
+if !config.json_output {
+println!("Discovering Path MTU to {} ({})...", target.name, target.addr);
+}
+let mut low = 128usize;
+let mut high = 9000usize;
+let mut best_ok = 0usize;
+while low <= high {
+let mid = low + (high - low) / 2;
+let mut pkt = Packet::new();
+pkt.reply_requested = true;
+pkt.min_size = mid;
+pkt.pad_pattern = config.pad_pattern.clone();
+let msg_id = pkt.message_id;
+{
+let mut st = state.lock().await;
+st.sent_packets.insert(
+msg_id,
+SentRecord {
+target_name: target.name.clone(),
+seq: Some(mid as u64),
+sent_at: Instant::now(),
+tx_wall_ns: now_utc_ns(),
+peer: target.addr,
+is_first_leg: true,
+acked: false,
+},
+);
+st.global_stats.pings_transmitted += 1;
+st.global_stats.raw_tx += 1;
+let t_stats = st.per_target_stats.entry(target.name.clone()).or_default();
+t_stats.pings_transmitted += 1;
+t_stats.raw_tx += 1;
+}
+let wire = pkt.encode(security);
+let actual_payload_len = wire.len();
+if socket.send_to(&wire, target.addr).await.is_err() {
+high = mid - 1;
+continue;
+}
+let mut got_ack = false;
+for _ in 0..8 {
+time::sleep(Duration::from_millis(50)).await;
+let st = state.lock().await;
+if let Some(rec) = st.sent_packets.get(&msg_id) {
+if rec.acked {
+got_ack = true;
+break;
+}
+}
+}
+if got_ack {
+best_ok = actual_payload_len;
+low = mid + 1;
+} else {
+high = mid - 1;
+}
+}
+let ip_overhead = if target.addr.is_ipv6() { 48 } else { 28 };
+let path_mtu = if best_ok > 0 { best_ok + ip_overhead } else { 0 };
+if config.json_output {
+let ev = JsonEvent::MtuResult {
+target: &target.name,
+peer: target.addr.to_string(),
+discovered_mtu_bytes: path_mtu,
+};
+if let Ok(line) = serde_json::to_string(&ev) {
+println!("{}", line);
+}
+} else {
+println!(
+"Path MTU to {} ({}): {} bytes (max UDP payload {} bytes)",
+target.name, target.addr, path_mtu, best_ok
+);
+}
+}
 Ok(())
 }

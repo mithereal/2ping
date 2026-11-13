@@ -1,34 +1,39 @@
 # 2ping (twoping-rs)
 
-A fast, asynchronous Rust rewrite of **2ping**, a bi-directional UDP ping utility. Using 3-way handshakes (akin to TCP `SYN`, `SYN/ACK`, `ACK`) and after-the-fact state comparison between a listener and a client, `2ping` determines whether packet loss occurs on the **outbound** or **inbound** path.
+An enterprise-grade, asynchronous Rust implementation of **2ping**, a bi-directional UDP ping utility. Using 3-way handshakes (akin to TCP `SYN`, `SYN/ACK`, `ACK`) and after-the-fact state comparison between listeners and clients, `2ping` isolates whether packet loss or latency spikes occur on the **outbound** or **inbound** network path.
+
 
 ---
 
-## Differences from the Original Python `2ping`
+## Comparison: Original Python `2ping` vs. Rust `2ping` (`v1.0.0`)
 
-While remaining compatible with the core `2ping` binary wire framing (`0x3250` magic header, 16-bit one's complement checksums, 48-bit Message IDs, and standard opcodes), this Rust implementation introduces major upgrades in timing accuracy, cryptography, observability, and runtime performance:
+While remaining wire-compatible with the core `2ping` binary framing (`0x3250` magic header, 16-bit one's complement checksums, 48-bit Message IDs, and standard opcodes), this Rust rewrite delivers major improvements in timing accuracy, cryptography, multi-target scale, and observability:
 
-| Feature / Capability | Original Python `2ping` | Rust `2ping` (`v0.4.0`) |
+| Capability | Original Python `2ping` | Rust `2ping` (`v1.0.0`) |
 | :--- | :--- | :--- |
-| **Runtime & Concurrency** | Single-threaded Python 3 event loop with optional external dependencies (`pycryptodomex`, `dnspython`, `netifaces`) | Compiled native binary powered by `tokio` async I/O with zero runtime interpreter overhead |
-| **Receive Timestamps** | User-space `time.time()` calls subject to Python GIL and event-loop wakeup jitter | Kernel nanosecond receive timestamps via `SO_TIMESTAMPNS` / `SCM_TIMESTAMPNS` (`recvmsg`) on Linux |
-| **Host Processing Delay** | Parses `HostLatency` (`0x0010`) | Measures exact listener processing time in microseconds and subtracts it from client RTT to isolate true network transit latency |
-| **Statistical Output** | Basic `min / avg / max` RTT and directional loss percentages | Adds standard deviation (`mdev`), RFC 3550 smoothed inter-packet jitter, and tail latency percentiles (`p50 / p95 / p99`) |
-| **Encryption & Auth** | Separate `AES-256-CBC` + `HMAC` (`hmac-md5`, `hmac-sha256`, `hmac-sha512`) | Defaults to modern **`ChaCha20-Poly1305` AEAD** (authenticating the 12-byte outer header as Associated Data) while retaining `AES-256-CBC` + `HMAC` compatibility |
-| **Replay Protection** | Relies on short-lived state cleanup | Dedicated bounded sliding-window `ReplayCache` (30s TTL, 10,000 entries per peer) dropping duplicate Message IDs |
-| **QoS / DiffServ Marking** | Not available natively | Built-in `--dscp` flag (`EF`, `AF41`, `CS5`, or `0..63`) setting `IP_TOS` / `IPV6_TCLASS` |
-| **Telemetry & Observability** | Human-readable stdout text only | Native `--json` (NDJSON) streaming output and an optional `--metrics-port` Prometheus `/metrics` HTTP endpoint |
+| **Runtime & Memory** | Single-threaded Python 3 process with optional C-extensions (`pycryptodomex`, `dnspython`, `netifaces`) | Single compiled native binary powered by `tokio` async I/O with bounded `10,000`-sample ring buffers for flat 24/7 memory usage |
+| **Receive Timestamps** | User-space `time.time()` calls subject to Python GIL and event-loop jitter | Kernel nanosecond receive timestamps via `SO_TIMESTAMPNS` / `SCM_TIMESTAMPNS` (`recvmsg`) on Linux |
+| **One-Way Delay (OWD)** | RTT only | Embeds nanosecond UTC wall-clock opcodes (`TxTimestampNs` / `RxTimestampNs`) to separate **outbound transit ms** from **inbound transit ms** on NTP/PTP-synced hosts |
+| **Host Processing Delay** | Parses `HostLatency` (`0x0010`) | Measures exact listener processing delay in microseconds and subtracts it from client RTT to isolate true network transit time |
+| **Multi-Target & Dual-Stack** | Single target per invocation | Probes multiple hosts concurrently (`2ping host1 host2 ...`) over a single dual-stack `[::]` IPv4/IPv6 UDP socket |
+| **Path MTU Discovery** | Not supported | Built-in `--mtu-discover` binary search (`128..9000` bytes) with IP Don't Fragment (`DF`) enabled to pinpoint tunnel/VPN MTU ceilings |
+| **Cryptography & Key Rotation** | Single static secret with `AES-256-CBC` + `HMAC` | Defaults to **`ChaCha20-Poly1305` AEAD** (binding the 12-byte outer header as Associated Data), supports **zero-downtime multi-key rotation (`--keyring`)**, and includes a sliding-window `ReplayCache` |
+| **QoS / DiffServ Marking** | Not supported | Built-in `--dscp` flag (`EF`, `AF41`, `CS5`, or `0..63`) setting `IP_TOS` / `IPV6_TCLASS` |
+| **Observability & UI** | Plaintext stdout only | Live interactive **`--tui` terminal dashboard** (sparklines & directional gauges), **`--json` NDJSON** streaming, and a **`--metrics-port` Prometheus `/metrics`** HTTP exporter |
+
 
 ---
 
 ## Features
 
-- **Directional Packet Loss Detection:** Distinguishes between outbound loss, inbound loss, and undetermined loss using 3-way UDP exchanges and `Investigate` / `CourtesyExpires` state tracking.
-- **Kernel-Level Precision:** Uses Linux `SO_TIMESTAMPNS` ancillary messages and `HostLatency` subtraction to eliminate user-space scheduling jitter.
-- **Tail Latency & Jitter Metrics:** Reports `min/avg/max/mdev`, RFC 3550 jitter, and `p50/p95/p99` percentiles.
-- **Modern AEAD & Legacy Crypto:** Supports `ChaCha20-Poly1305` AEAD encryption (default) as well as `AES-256-CBC` and constant-time `HMAC` (`hmac-md5`, `hmac-sha256`, `hmac-sha512`).
-- **Anti-Replay Protection:** Rejects replayed UDP datagrams using a per-peer sliding-window cache.
-- **SRE & DevOps Ready:** Supports `--json` NDJSON event logging, `--dscp` QoS queue testing, and a built-in Prometheus `/metrics` endpoint.
+- **Directional Packet Loss & One-Way Latency:** Distinguishes outbound vs. inbound drops and separates upload vs. download transit times.
+- **Kernel-Level Precision:** Uses Linux `SO_TIMESTAMPNS` ancillary control messages and `HostLatency` subtraction to eliminate user-space scheduling jitter.
+- **Tail Latency & Jitter Metrics:** Computes `min/avg/max/mdev`, RFC 3550 smoothed jitter, and `p50/p95/p99` percentiles over a bounded sliding window.
+- **Zero-Downtime Key Rotation (`--keyring`):** Supports active and staged secrets via `KeyId` (`0x0080`) with `ChaCha20-Poly1305` AEAD or `AES-256-CBC` + `HMAC`.
+- **Anti-Replay Protection:** Drops duplicate UDP packets per peer using a bounded 30-second sliding-window cache.
+- **Path MTU Sweep (`--mtu-discover`):** Binary-searches maximum non-fragmented packet sizes (`128..9000` bytes) to uncover asymmetric MTU blackholes.
+- **Fleet & DevOps Ready:** Supports declarative TOML configs (`--config`), DNS `SRV` auto-discovery (`--srv`), adaptive loss backoff (`--adaptive`), interactive `--tui`, `--json` NDJSON logs, and Prometheus `/metrics`.
+
 
 ---
 
@@ -117,17 +122,55 @@ With `ChaCha20-Poly1305` (the default cipher), a single `--encrypt` secret provi
 2ping <LISTENER_IP_OR_HOST> -c 5 --dscp EF --json
 ```
 
+### 5. Declarative TOML Config & Zero-Downtime Key Rotation
+
+Create `2ping.toml`:
+
+```toml
+port = 15998
+metrics_port = 9100
+interval = 1.0
+dscp = "EF"
+adaptive = true
+targets = ["10.0.0.5", "10.0.0.12"]
+
+active_key_id = "2026-q4"
+
+[[keys]]
+id = "2026-q3"
+encrypt_secret = "previous-quarter-secret-key"
+
+[[keys]]
+id = "2026-q4"
+encrypt_secret = "current-quarter-secret-key"
+```
+
+### 6. Path MTU Discovery & QoS DSCP Probing
+
+```bash
+# Binary-search Path MTU (128..9000B) with Don't Fragment set
+2ping 10.0.0.5 --mtu-discover
+
+# Probe Expedited Forwarding (EF) QoS queue with NDJSON telemetry
+2ping 10.0.0.5 -c 5 --dscp EF --json
 ---
 
 ## CLI Options
 
 | Flag | Default | Description |
 | :--- | :--- | :--- |
-| `<HOST>` | — | Hostname or IP address of the `2ping` listener (client mode) |
-| `--listen` | `false` | Start in listener mode |
+| `<HOSTS...>` | — | One or more hostnames or IPv4/IPv6 addresses of `2ping` listeners |
+| `--config <FILE>` | — | Load fleet targets, ports, DSCP, and keyring from a TOML file |
+| `--keyring <FILE>` | — | Load multi-key rotation secrets from a TOML keyring file |
+| `--active-key-id <ID>` | First key | Key ID from keyring used to sign/encrypt outgoing packets |
+| `--listen` | `false` | Start in dual-stack IPv4/IPv6 listener mode |
+| `--srv` | `false` | Resolve target hosts via `_2ping._udp.<domain>` DNS `SRV` records |
+| `--mtu-discover` | `false` | Binary-search Path MTU (`128..9000` bytes) with Dont Fragment set |
+| `--tui` | `false` | Launch interactive live terminal UI dashboard (`ratatui`) |
+| `--adaptive` | `false` | Automatically back off probe interval during high packet loss (`>20%`) |
 | `--port <PORT>` | `15998` | UDP port to bind (listener) or connect to (client) |
 | `--metrics-port <PORT>` | — | Expose Prometheus `/metrics` HTTP endpoint on the specified port |
-| `-c, --count <N>` | Infinite | Stop after sending `N` pings |
+| `-c, --count <N>` | Infinite | Stop after sending `N` pings per target |
 | `-i, --interval <SEC>` | `1.0` | Wait interval in seconds between sending packets |
 | `--min-packet-size <BYTES>` | `128` | Minimum wire packet size in bytes |
 | `-s <BYTES>` | — | Ping compatibility payload size (`min-packet-size = bytes + 8`) |
@@ -142,24 +185,27 @@ With `ChaCha20-Poly1305` (the default cipher), a single `--encrypt` secret provi
 | `-q, --quiet` | `false` | Quiet output (only display startup and final summary) |
 | `-v, --verbose` | `false` | Print per-packet decode and drop diagnostics |
 
+
 ---
 
 ## Project Architecture
 
 ```text
 2ping-rs/
-├── Cargo.toml                  # Crate config (outputs `2ping` binary) and dependencies
+├── Cargo.toml                  # Crate manifest (`2ping` binary + library exports)
 ├── Dockerfile                  # Multi-stage container build
 ├── docker-compose.yml          # Listener + client test stack
-└── src/
-    ├── lib.rs                  # Library module exports
-    ├── main.rs                 # CLI parsing, DSCP socket setup, and entrypoint
-    ├── crypto.rs               # PBKDF2 key derivation, ChaCha20-Poly1305, AES-256-CBC, HMAC
-    ├── protocol.rs             # Binary wire encoding, decoding, and checksums
-    ├── timestamp.rs            # Linux SO_TIMESTAMPNS kernel receive timestamps
-    └── engine.rs               # Async 3-way state machine, replay cache, stats, and metrics
+├── src/
+│   ├── lib.rs                  # Library module exports
+│   ├── main.rs                 # CLI parsing, TOML config, dual-stack socket & DNS SRV
+│   ├── config.rs               # TOML fleet configuration and keyring parser
+│   ├── crypto.rs               # PBKDF2 key derivation, Multi-Key Ring, ChaCha20-Poly1305, AES-CBC, HMAC
+│   ├── protocol.rs             # Binary wire encoding, decoding, OWD & KeyId opcodes, checksums
+│   ├── timestamp.rs            # Linux SO_TIMESTAMPNS kernel receive timestamps & UTC wall clock
+│   ├── tui.rs                  # Live Ratatui sparkline and directional loss terminal dashboard
+│   └── engine.rs               # Async 3-way state machine, replay cache, MTU sweep, stats & metrics
 └── tests/
-    └── protocol_and_crypto.rs  # Unit and loopback UDP integration tests
+    └── protocol_and_crypto.rs  # Unit and multi-target loopback UDP integration 
 ```
 
 ---
