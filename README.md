@@ -174,34 +174,39 @@ cargo test
 
 ---
 
-## Run Systemd Server.
+## Run 2ping Server via Systemd.
 
  Installation & Activation Commands
 
 Run these commands on your Linux server to install the binary, configure the service, and enable it at boot:
 bash
-# 1. Copy the compiled release binary to /usr/local/bin
+## 1. Copy the compiled release binary to /usr/local/bin
 sudo cp target/release/2ping /usr/local/bin/2ping
 sudo chmod 755 /usr/local/bin/2ping
 
-# 2. Create the environment file (restrict permissions to root)
+## 2. Create the environment file (restrict permissions to root)
 sudo bash -c 'echo "TWOPING_OPTS=\"--quiet\"" > /etc/default/2ping'
 sudo chmod 600 /etc/default/2ping
 
-# 3. Reload systemd, enable at boot, and start immediately
+## 3. Reload systemd, enable at boot, and start immediately
 sudo systemctl daemon-reload
 sudo systemctl enable --now 2ping.service
-Use code with caution.
 
-4. Verification & Firewall Notes
+## 4. Verification & Firewall Notes
 
 • Check service status and logs:bash
+
 sudo systemctl status 2ping.service
+
 sudo journalctl -u 2ping.service -f
-Use code with caution.
-• Open UDP port 15998 in your firewall:
-	• UFW (Ubuntu/Debian): sudo ufw allow 15998/udp
-	• firewalld (RHEL/Fedora): sudo firewall-cmd --add-port=15998/udp --permanent && sudo firewall-cmd --reload
+
+    • Open UDP port 15998 in your firewall:
+
+    • UFW (Ubuntu/Debian): sudo ufw allow 15998/udp
+
+• firewalld (RHEL/Fedora): sudo firewall-cmd --add-port=15998/udp 
+    --permanent && sudo firewall-cmd --reload
+
 
 
 ## License
