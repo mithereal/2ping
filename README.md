@@ -283,19 +283,19 @@ cargo test
 
 Run these commands on your Linux server to install the binary, configure the service, and enable it at boot:
 bash
-## 1. Copy the compiled release binary to /usr/local/bin
+### 1. Copy the compiled release binary to /usr/local/bin
 sudo cp target/release/2ping /usr/local/bin/2ping
 sudo chmod 755 /usr/local/bin/2ping
 
-## 2. Create the environment file (restrict permissions to root)
+### 2. Create the environment file (restrict permissions to root)
 sudo bash -c 'echo "TWOPING_OPTS=\"--quiet\"" > /etc/default/2ping'
 sudo chmod 600 /etc/default/2ping
 
-## 3. Reload systemd, enable at boot, and start immediately
+### 3. Reload systemd, enable at boot, and start immediately
 sudo systemctl daemon-reload
 sudo systemctl enable --now 2ping.service
 
-## 4. Verification & Firewall Notes
+### 4. Verification & Firewall Notes
 
 • Check service status and logs:bash
 
