@@ -1,0 +1,26 @@
+[package]
+name = "twoping"
+version = "0.2.0"
+edition = "2021"
+description = "A bi-directional ping utility written in Rust with HMAC and AES-256-CBC"
+
+[[bin]]
+name = "2ping"
+path = "src/main.rs"
+
+[dependencies]
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+clap = { version = "4.5", features = ["derive"] }
+hmac = "0.12"
+md-5 = "0.10"
+pbkdf2 = "0.12"
+rand = "0.8"
+sha2 = "0.10"
+subtle = "2.5"
+tokio = { version = "1.37", features = ["full"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

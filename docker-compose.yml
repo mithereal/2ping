@@ -1,0 +1,43 @@
+services:
+  listener:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: 2ping-listener
+    command:
+      - "--listen"
+      - "--auth"
+      - "${TWOPING_AUTH_SECRET:-change-me-hmac-secret}"
+      - "--auth-digest"
+      - "hmac-sha512"
+      - "--encrypt"
+      - "${TWOPING_ENCRYPT_SECRET:-change-me-aes-secret}"
+    ports:
+      - "15998:15998/udp"
+    networks:
+      - twoping-net
+    restart: unless-stopped
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: 2ping-client
+    depends_on:
+      - listener
+    command:
+      - "listener"
+      - "-c"
+      - "10"
+      - "--auth"
+      - "${TWOPING_AUTH_SECRET:-change-me-hmac-secret}"
+      - "--auth-digest"
+      - "hmac-sha512"
+      - "--encrypt"
+      - "${TWOPING_ENCRYPT_SECRET:-change-me-aes-secret}"
+    networks:
+      - twoping-net
+
+networks:
+  twoping-net:
+    driver: bridge
