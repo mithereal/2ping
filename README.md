@@ -243,7 +243,6 @@ kill -HUP $(pidof 2ping)
 ```text
 2ping-rs/
 ├── Cargo.toml                  # Crate manifest (`2ping` binary, library exports, optional `webhooks` feature)
-Use code with caution.
 ├── Dockerfile                  # Multi-stage container build
 ├── docker-compose.yml          # Dual-stack listener, client, and TUI compose stack
 ├── .github/workflows/
