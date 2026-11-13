@@ -1,0 +1,51 @@
+groups:
+  - name: twoping_network_alerts
+    interval: 15s
+    rules:
+      - alert: TwoPingOutboundPacketLoss
+        expr: |
+          (
+            rate(twoping_outbound_loss_total[2m])
+            /
+            clamp_min(rate(twoping_pings_transmitted_total[2m]), 0.001)
+          ) > 0.05
+        for: 1m
+        labels:
+          severity: warning
+          direction: outbound
+        annotations:
+          summary: "High outbound packet loss on {{ $labels.instance }}"
+          description: "Outbound (egress) packet loss exceeds 5% ({{ $value | humanizePercentage }}) over the last 2 minutes."
+
+      - alert: TwoPingInboundPacketLoss
+        expr: |
+          (
+            rate(twoping_inbound_loss_total[2m])
+            /
+            clamp_min(rate(twoping_pings_transmitted_total[2m]), 0.001)
+          ) > 0.05
+        for: 1m
+        labels:
+          severity: warning
+          direction: inbound
+        annotations:
+          summary: "High inbound packet loss on {{ $labels.instance }}"
+          description: "Inbound (ingress) packet loss exceeds 5% ({{ $value | humanizePercentage }}) over the last 2 minutes."
+
+      - alert: TwoPingHighJitter
+        expr: twoping_jitter_ms > 25
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated network jitter on {{ $labels.instance }}"
+          description: "Smoothed inter-packet jitter is {{ $value }}ms (threshold: 25ms)."
+
+      - alert: TwoPingInvalidOrReplayedPackets
+        expr: rate(twoping_dropped_invalid_total[5m]) > 1
+        for: 1m
+        labels:
+          severity: info
+        annotations:
+          summary: "Invalid or replayed 2ping packets detected on {{ $labels.instance }}"
+          description: "Dropping {{ $value }} malformed, unauthenticated, or replayed packets/sec."

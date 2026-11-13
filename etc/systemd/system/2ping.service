@@ -1,0 +1,31 @@
+[Unit]
+Description=2ping Bi-Directional UDP Ping Listener
+Documentation=https://finnie.org
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+EnvironmentFile=-/etc/default/2ping
+ExecStart=/usr/local/bin/2ping --listen $TWOPING_OPTS
+Restart=on-failure
+RestartSec=3s
+
+# Hardening & Sandboxing
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

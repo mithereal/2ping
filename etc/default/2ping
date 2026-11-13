@@ -1,0 +1,5 @@
+# Example 1: Public / unencrypted listener on default port 15998
+TWOPING_OPTS="--quiet"
+
+# Example 2: Authenticated + AEAD encrypted listener with Prometheus metrics
+# TWOPING_OPTS="--quiet --encrypt 'your-strong-secret-key' --metrics-port 9100"
