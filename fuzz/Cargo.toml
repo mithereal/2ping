@@ -1,0 +1,29 @@
+[package]
+name = "twoping-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+toml = "0.8"
+
+[dependencies.twoping]
+path = ".."
+
+[[bin]]
+name = "packet_decode"
+path = "fuzz_targets/packet_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_and_keyring"
+path = "fuzz_targets/config_and_keyring.rs"
+test = false
+doc = false
+bench = false

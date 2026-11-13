@@ -100,3 +100,18 @@ tags: ${{ steps.meta.outputs.tags }}
 labels: ${{ steps.meta.outputs.labels }}
 cache-from: type=gha
 cache-to: type=gha,mode=max
+
+# fuzz-smoke-test:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - name: Checkout repository
+#         uses: actions/checkout@v4
+
+#       - name: Install nightly Rust toolchain
+#         uses: dtolnay/rust-toolchain@nightly
+
+#       - name: Install cargo-fuzz
+#         run: cargo install cargo-fuzz
+
+#       - name: Run 30s packet_decode fuzz smoke test
+#         run: cargo +nightly fuzz run packet_decode -- -max_total_time=30 -max_len=2048
