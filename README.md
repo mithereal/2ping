@@ -204,7 +204,7 @@ sudo journalctl -u 2ping.service -f
 
     • UFW (Ubuntu/Debian): sudo ufw allow 15998/udp
 
-• firewalld (RHEL/Fedora): sudo firewall-cmd --add-port=15998/udp 
+    • firewalld (RHEL/Fedora): sudo firewall-cmd --add-port=15998/udp 
     --permanent && sudo firewall-cmd --reload
 
 
