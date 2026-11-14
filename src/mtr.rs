@@ -3,7 +3,6 @@ use crate::engine::TargetSpec;
 use crate::protocol::Packet;
 use serde::Serialize;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -226,18 +225,18 @@ fn bind_icmp_listener(is_v6: bool) -> Option<UdpSocket> {
 fn icmp_matches_udp_port(buf: &[u8], src_port: u16, dst_port: u16, is_v6: bool) -> bool {
     if is_v6 {
         // ICMPv6 Header (8B) + Inner IPv6 Header (40B) + Inner UDP Header (4B ports) = 52B
-        if buf.len() < 52 || buf != 3 {
+        if buf.len() < 52 || buf[0] != 3 {
             return false;
         }
-        let s_port = u16::from_be_bytes([buf, buf]);
-        let d_port = u16::from_be_bytes([buf, buf]);
+        let s_port = u16::from_be_bytes([buf[48], buf[49]]);
+        let d_port = u16::from_be_bytes([buf[50], buf[51]]);
         s_port == src_port && d_port == dst_port
     } else {
         // IPv4 Header (20B) + ICMP Header (8B) + Inner IPv4 Header (20B) + Inner UDP Ports (4B) = 52B
         if buf.len() < 52 {
             return false;
         }
-        let ihl = ((buf & 0x0F) as usize) * 4;
+        let ihl = ((buf[0] & 0x0F) as usize) * 4;
         if buf.len() < ihl + 8 + 20 + 4 || buf[ihl] != 11 {
             return false;
         }

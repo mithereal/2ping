@@ -323,68 +323,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let shared_security = Arc::new(RwLock::new(initial_security));
     let shared_targets = Arc::new(RwLock::new(initial_targets));
-// Start hot-reload watcher for SIGHUP and file changes
-spawn_hot_reloader(
-RuntimeControls {
-security: Arc::clone(&shared_security),
-targets: Arc::clone(&shared_targets),
-},
-ReloadSpec {
-config_path: cli.config.clone(),
-keyring_path: cli.keyring.clone(),
-cli_active_key_id: cli.active_key_id.clone(),
-cli_auth: cli.auth.clone(),
-cli_encrypt: cli.encrypt.clone(),
-digest,
-encrypt_method: enc_method,
-default_port: port,
-use_srv,
-cli_hosts_override,
-quiet: cli.quiet,
-json_output: cli.json,
-},
-);
-if cli.mtr {
-run_mtr_trace(
-shared_targets,
-shared_security,
-cli.max_hops,
-cli.mtr_rounds,
-cli.json,
-)
-.await?;
-return Ok(());
-}
-#[cfg(feature = "webhooks")]
-let webhook_cfg = WebhookConfig {
-url: cli.webhook_url.or(file_cfg.webhook_url),
-loss_threshold_pct: file_cfg
-.webhook_loss_threshold
-.unwrap_or(cli.webhook_loss_threshold),
-rtt_threshold_ms: cli.webhook_rtt_threshold.or(file_cfg.webhook_rtt_threshold),
-cooldown: Duration::from_secs(60),
-};
-#[cfg(not(feature = "webhooks"))]
-let webhook_cfg = WebhookConfig::default();
-let socket = bind_dual_stack_socket(bind_port, tos_byte, cli.mtu_discover)?;
-let config = EngineConfig {
-listen_mode,
-targets: shared_targets,
-interval: Duration::from_secs_f64(interval_sec.max(0.01)),
-count,
-min_packet_size,
-pad_pattern,
-quiet: cli.quiet,
-verbose: cli.verbose,
-three_way: !cli.no_3way,
-json_output: cli.json,
-mtu_discover: cli.mtu_discover,
-tui_mode: cli.tui,
-adaptive,
-metrics_port,
-security: shared_security,
-webhook: Arc::new(WebhookDispatcher::new(webhook_cfg)),
-};
-run_engine(socket, config).await?;
-Ok(())
+
+    // Start hot-reload watcher for SIGHUP and file changes
+    spawn_hot_reloader(
+        RuntimeControls {
+            security: Arc::clone(&shared_security),
+            targets: Arc::clone(&shared_targets),
+        },
+        ReloadSpec {
+            config_path: cli.config.clone(),
+            keyring_path: cli.keyring.clone(),
+            cli_active_key_id: cli.active_key_id.clone(),
+            cli_auth: cli.auth.clone(),
+            cli_encrypt: cli.encrypt.clone(),
+            digest,
+            encrypt_method: enc_method,
+            default_port: port,
+            use_srv,
+            cli_hosts_override,
+            quiet: cli.quiet,
+            json_output: cli.json,
+        },
+    );
+
+    if cli.mtr {
+        run_mtr_trace(
+            shared_targets,
+            shared_security,
+            cli.max_hops,
+            cli.mtr_rounds,
+            cli.json,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    #[cfg(feature = "webhooks")]
+    let webhook_cfg = WebhookConfig {
+        url: cli.webhook_url.or(file_cfg.webhook_url),
+        loss_threshold_pct: file_cfg
+            .webhook_loss_threshold
+            .unwrap_or(cli.webhook_loss_threshold),
+        rtt_threshold_ms: cli.webhook_rtt_threshold.or(file_cfg.webhook_rtt_threshold),
+        cooldown: Duration::from_secs(60),
+    };
+
+    #[cfg(not(feature = "webhooks"))]
+    let webhook_cfg = WebhookConfig::default();
+
+    let socket = bind_dual_stack_socket(bind_port, tos_byte, cli.mtu_discover)?;
+    let config = EngineConfig {
+        listen_mode,
+        targets: shared_targets,
+        interval: Duration::from_secs_f64(interval_sec.max(0.01)),
+        count,
+        min_packet_size,
+        pad_pattern,
+        quiet: cli.quiet,
+        verbose: cli.verbose,
+        three_way: !cli.no_3way,
+        json_output: cli.json,
+        mtu_discover: cli.mtu_discover,
+        tui_mode: cli.tui,
+        adaptive,
+        metrics_port,
+        security: shared_security,
+        webhook: Arc::new(WebhookDispatcher::new(webhook_cfg)),
+    };
+
+    run_engine(socket, config).await?;
+    Ok(())
 }

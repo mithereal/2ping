@@ -32,6 +32,8 @@ struct WebhookPayload<'a> {
     loss_pct: f64,
     avg_rtt_ms: f64,
     jitter_ms: f64,
+    #[cfg(feature = "grafana")]
+    grafana_alert: bool,
 }
 
 pub struct WebhookDispatcher {
@@ -120,6 +122,8 @@ impl WebhookDispatcher {
                     loss_pct,
                     avg_rtt_ms,
                     jitter_ms,
+                    #[cfg(feature = "grafana")]
+                    grafana_alert: true,
                 };
                 let _ = client.post(url).json(&payload).send().await;
             } else if was_degraded {
@@ -136,6 +140,8 @@ impl WebhookDispatcher {
                     loss_pct,
                     avg_rtt_ms,
                     jitter_ms,
+                    #[cfg(feature = "grafana")]
+                    grafana_alert: false,
                 };
                 let _ = client.post(url).json(&payload).send().await;
             }

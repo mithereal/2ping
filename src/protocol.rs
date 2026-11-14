@@ -226,16 +226,16 @@ impl Packet {
             return Err("Packet too short");
         }
 
-        let magic = u16::from_be_bytes([data, data]);
+        let magic = u16::from_be_bytes([data[0], data[1]]);
         if magic != MAGIC_NUMBER {
             return Err("Invalid magic number");
         }
 
-        let packet_csum = u16::from_be_bytes([data, data]);
+        let packet_csum = u16::from_be_bytes([data[2], data[3]]);
         if packet_csum != 0 {
             let mut verify_buf = data.to_vec();
-            verify_buf = 0;
-            verify_buf = 0;
+            verify_buf[2] = 0;
+            verify_buf[3] = 0;
             if compute_checksum(&verify_buf) != packet_csum {
                 return Err("Checksum mismatch");
             }
@@ -243,7 +243,7 @@ impl Packet {
 
         let mut message_id = [0u8; 6];
         message_id.copy_from_slice(&data[4..10]);
-        let outer_flags = u16::from_be_bytes([data, data]);
+        let outer_flags = u16::from_be_bytes([data[10], data[11]]);
 
         if sec.requires_auth() && (outer_flags & opcodes::HMAC) == 0 {
             return Err("Rejected unauthenticated packet (--auth required)");
@@ -270,151 +270,159 @@ impl Packet {
             }
             let field_len = u16::from_be_bytes(len_bytes) as usize;
             let value_start = MIN_HEADER_LEN + cursor.position() as usize;
-let mut payload = vec![0u8; field_len];
-if cursor.read_exact(&mut payload).is_err() {
-return Err("Truncated opcode data");
+            let mut payload = vec![0u8; field_len];
+            if cursor.read_exact(&mut payload).is_err() {
+                return Err("Truncated opcode data");
+            }
+            match flag {
+                opcodes::HMAC => {
+                    hmac_span = Some((value_start, payload));
+                }
+                opcodes::KEY_ID => {
+                    key_id_str = String::from_utf8(payload).ok();
+                }
+                opcodes::ENCRYPTED => {
+                    encrypted_blob = Some(payload);
+                }
+                _ => {
+                    outer_opcodes.push((flag, payload));
+                }
+            }
+        }
+
+        if let Some((offset, tag_bytes)) = hmac_span {
+            if !sec.requires_auth() {
+                return Err("Received HMAC packet without --auth key configured");
+            }
+            let mut auth_buf = data.to_vec();
+            auth_buf[2] = 0;
+            auth_buf[3] = 0;
+            for b in &mut auth_buf[offset..offset + tag_bytes.len()] {
+                *b = 0;
+            }
+            if !sec.verify_hmac(&auth_buf, &tag_bytes, key_id_str.as_deref()) {
+                return Err("HMAC authentication failed");
+            }
+        }
+
+        let mut pkt = Packet {
+            message_id,
+            reply_requested: (outer_flags & opcodes::REPLY_REQUESTED) != 0,
+            key_id: key_id_str.clone(),
+            ..Default::default()
+        };
+
+        if let Some(blob) = encrypted_blob {
+            let aad = Self::build_canonical_aad(&message_id, outer_flags);
+            let plaintext = match sec.encrypt_method {
+                EncryptMethod::ChaCha20Poly1305 => {
+                    sec.decrypt_chacha20_poly1305(&blob, &aad, key_id_str.as_deref())?
+                }
+                EncryptMethod::Aes256Cbc => {
+                    sec.decrypt_aes256_cbc(&blob, key_id_str.as_deref())?
+                }
+            };
+            if plaintext.len() < 2 {
+                return Err("Decrypted payload too short");
+            }
+            let inner_flags = u16::from_be_bytes([plaintext[0], plaintext[1]]);
+            pkt.reply_requested = (inner_flags & opcodes::REPLY_REQUESTED) != 0;
+            let mut inner_cursor = Cursor::new(&plaintext[2..]);
+            for bit in 1..16 {
+                let flag = 1u16 << bit;
+                if (inner_flags & flag) == 0 {
+                    continue;
+                }
+                let mut len_bytes = [0u8; 2];
+                if inner_cursor.read_exact(&mut len_bytes).is_err() {
+                    return Err("Truncated decrypted opcode length");
+                }
+                let field_len = u16::from_be_bytes(len_bytes) as usize;
+                let mut payload = vec![0u8; field_len];
+                if inner_cursor.read_exact(&mut payload).is_err() {
+                    return Err("Truncated decrypted opcode data");
+                }
+                pkt.apply_opcode(flag, &payload);
+            }
+        } else {
+            for (flag, payload) in outer_opcodes {
+                pkt.apply_opcode(flag, &payload);
+            }
+        }
+        Ok(pkt)
+    }
+
+    fn apply_opcode(&mut self, flag: u16, payload: &[u8]) {
+        match flag {
+            opcodes::IN_REPLY_TO if payload.len() >= 6 => {
+                let mut id = [0u8; 6];
+                id.copy_from_slice(&payload[..6]);
+                self.in_reply_to = Some(id);
+            }
+            opcodes::COURTESY_EXPIRES => {
+                for chunk in payload.chunks_exact(6) {
+                    let mut id = [0u8; 6];
+                    id.copy_from_slice(chunk);
+                    self.courtesy_expires.push(id);
+                }
+            }
+            opcodes::PING_TIME if payload.len() >= 4 => {
+                self.ping_time_us = Some(u32::from_be_bytes([
+                    payload[0], payload[1], payload[2], payload[3],
+                ]));
+            }
+            opcodes::HOST_LATENCY if payload.len() >= 4 => {
+                self.host_latency_us = Some(u32::from_be_bytes([
+                    payload[0], payload[1], payload[2], payload[3],
+                ]));
+            }
+            opcodes::INVESTIGATE => {
+                for chunk in payload.chunks_exact(6) {
+                    let mut id = [0u8; 6];
+                    id.copy_from_slice(chunk);
+                    self.investigate.push(id);
+                }
+            }
+            opcodes::TX_TIMESTAMP_NS if payload.len() >= 8 => {
+                self.tx_timestamp_ns = Some(u64::from_be_bytes([
+                    payload[0], payload[1], payload[2], payload[3],
+                    payload[4], payload[5], payload[6], payload[7],
+                ]));
+            }
+            opcodes::RX_TIMESTAMP_NS if payload.len() >= 8 => {
+                self.rx_timestamp_ns = Some(u64::from_be_bytes([
+                    payload[0], payload[1], payload[2], payload[3],
+                    payload[4], payload[5], payload[6], payload[7],
+                ]));
+            }
+            _ => {}
+        }
+    }
 }
-match flag {
-opcodes::HMAC => {
-hmac_span = Some((value_start, payload));
-}
-opcodes::KEY_ID => {
-key_id_str = String::from_utf8(payload).ok();
-}
-opcodes::ENCRYPTED => {
-encrypted_blob = Some(payload);
-}
-_ => {
-outer_opcodes.push((flag, payload));
-}
-}
-}
-if let Some((offset, tag_bytes)) = hmac_span {
-if !sec.requires_auth() {
-return Err("Received HMAC packet without --auth key configured");
-}
-let mut auth_buf = data.to_vec();
-auth_buf = 0;
-auth_buf = 0;
-for b in &mut auth_buf[offset..offset + tag_bytes.len()] {
-*b = 0;
-}
-if !sec.verify_hmac(&auth_buf, &tag_bytes, key_id_str.as_deref()) {
-return Err("HMAC authentication failed");
-}
-}
-let mut pkt = Packet {
-message_id,
-reply_requested: (outer_flags & opcodes::REPLY_REQUESTED) != 0,
-key_id: key_id_str.clone(),
-..Default::default()
-};
-if let Some(blob) = encrypted_blob {
-let aad = Self::build_canonical_aad(&message_id, outer_flags);
-let plaintext = match sec.encrypt_method {
-EncryptMethod::ChaCha20Poly1305 => {
-sec.decrypt_chacha20_poly1305(&blob, &aad, key_id_str.as_deref())?
-}
-EncryptMethod::Aes256Cbc => {
-sec.decrypt_aes256_cbc(&blob, key_id_str.as_deref())?
-}
-};
-if plaintext.len() < 2 {
-return Err("Decrypted payload too short");
-}
-let inner_flags = u16::from_be_bytes([plaintext, plaintext]);
-pkt.reply_requested = (inner_flags & opcodes::REPLY_REQUESTED) != 0;
-let mut inner_cursor = Cursor::new(&plaintext[2..]);
-for bit in 1..16 {
-let flag = 1u16 << bit;
-if (inner_flags & flag) == 0 {
-continue;
-}
-let mut len_bytes = [0u8; 2];
-if inner_cursor.read_exact(&mut len_bytes).is_err() {
-return Err("Truncated decrypted opcode length");
-}
-let field_len = u16::from_be_bytes(len_bytes) as usize;
-let mut payload = vec![0u8; field_len];
-if inner_cursor.read_exact(&mut payload).is_err() {
-return Err("Truncated decrypted opcode data");
-}
-pkt.apply_opcode(flag, &payload);
-}
-} else {
-for (flag, payload) in outer_opcodes {
-pkt.apply_opcode(flag, &payload);
-}
-}
-Ok(pkt)
-}
-fn apply_opcode(&mut self, flag: u16, payload: &[u8]) {
-match flag {
-opcodes::IN_REPLY_TO if payload.len() >= 6 => {
-let mut id = [0u8; 6];
-id.copy_from_slice(&payload[..6]);
-self.in_reply_to = Some(id);
-}
-opcodes::COURTESY_EXPIRES => {
-for chunk in payload.chunks_exact(6) {
-let mut id = [0u8; 6];
-id.copy_from_slice(chunk);
-self.courtesy_expires.push(id);
-}
-}
-opcodes::PING_TIME if payload.len() >= 4 => {
-self.ping_time_us = Some(u32::from_be_bytes([
-payload, payload, payload, payload,
-]));
-}
-opcodes::HOST_LATENCY if payload.len() >= 4 => {
-self.host_latency_us = Some(u32::from_be_bytes([
-payload, payload, payload, payload,
-]));
-}
-opcodes::INVESTIGATE => {
-for chunk in payload.chunks_exact(6) {
-let mut id = [0u8; 6];
-id.copy_from_slice(chunk);
-self.investigate.push(id);
-}
-}
-opcodes::TX_TIMESTAMP_NS if payload.len() >= 8 => {
-self.tx_timestamp_ns = Some(u64::from_be_bytes([
-payload, payload, payload, payload, payload, payload, payload, payload,
-]));
-}
-opcodes::RX_TIMESTAMP_NS if payload.len() >= 8 => {
-self.rx_timestamp_ns = Some(u64::from_be_bytes([
-payload, payload, payload, payload, payload, payload, payload, payload,
-]));
-}
-_ => {}
-}
-}
-}
+
 pub fn hex_id(id: &[u8; 6]) -> String {
-format!(
-"{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-id, id, id, id, id, id
-)
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        id[0], id[1], id[2], id[3], id[4], id[5]
+    )
 }
+
 fn compute_checksum(data: &[u8]) -> u16 {
-let mut sum: u32 = 0;
-let mut chunks = data.chunks_exact(2);
-for chunk in &mut chunks {
-sum += u16::from_be_bytes([chunk, chunk]) as u32;
-}
-if let Some(&rem) = chunks.remainder().first() {
-sum += (rem as u32) << 8;
-}
-while (sum >> 16) != 0 {
-sum = (sum & 0xFFFF) + (sum >> 16);
-}
-let res = !(sum as u16);
-if res == 0 {
-0xFFFF
-} else {
-res
-}
+    let mut sum: u32 = 0;
+    let mut chunks = data.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    if let Some(&rem) = chunks.remainder().first() {
+        sum += (rem as u32) << 8;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    let res = !(sum as u16);
+    if res == 0 {
+        0xFFFF
+    } else {
+        res
+    }
 }

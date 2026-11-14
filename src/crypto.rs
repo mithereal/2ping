@@ -192,7 +192,7 @@ impl SecurityConfig {
                 }
                 id.to_string()
             }
-            None => entries.id.clone(),
+            None => entries[0].id.clone(),
         };
 
         Ok(Self {
@@ -252,7 +252,7 @@ impl SecurityConfig {
         let Some(digest) = self.auth_digest else {
             return false;
         };
-        if field_payload.len() != 1 + digest.tag_len() || field_payload != digest.digest_id() {
+        if field_payload.len() != 1 + digest.tag_len() || field_payload[0] != digest.digest_id() {
             return false;
         }
         let Some(mat) = self.resolve_key(key_id) else {
@@ -321,47 +321,49 @@ impl SecurityConfig {
         let key = mat
             .encrypt_key
             .as_ref()
-.ok_or("Selected key entry has no encryption secret")?;
-if nonce_and_ct.len() < 12 + 16 {
-return Err("Invalid ChaCha20-Poly1305 ciphertext length");
-}
-let (nonce_bytes, ct) = nonce_and_ct.split_at(12);
-let cipher = ChaCha20Poly1305::new(key.into());
-let nonce = Nonce::from_slice(nonce_bytes);
-cipher
-.decrypt(nonce, Payload { msg: ct, aad })
-.map_err(|_| "ChaCha20-Poly1305 AEAD authentication or decryption failed")
-}
-pub fn encrypt_aes256_cbc(&self, plaintext: &[u8]) -> Option<Vec> {
-let mat = self.active_material()?;
-let key = mat.encrypt_key.as_ref()?;
-let mut iv = [0u8; 16];
-rand::thread_rng().fill_bytes(&mut iv);
-let ct = Aes256CbcEnc::new(key.into(), &iv.into())
-.encrypt_padded_vec_mut::(plaintext);
-let mut out = Vec::with_capacity(16 + ct.len());
-out.extend_from_slice(&iv);
-out.extend_from_slice(&ct);
-Some(out)
-}
-pub fn decrypt_aes256_cbc(
-&self,
-iv_and_ct: &[u8],
-key_id: Option<&str>,
-) -> Result<Vec, &'static str> {
-let mat = self
-.resolve_key(key_id)
-.ok_or("Unknown or unconfigured encryption key ID")?;
-let key = mat
-.encrypt_key
-.as_ref()
-.ok_or("Selected key entry has no encryption secret")?;
-if iv_and_ct.len() < 32 || (iv_and_ct.len() - 16) % 16 != 0 {
-return Err("Invalid AES-256-CBC ciphertext length");
-}
-let (iv, ct) = iv_and_ct.split_at(16);
-Aes256CbcDec::new(key.into(), iv.into())
-.decrypt_padded_vec_mut::(ct)
-.map_err(|_| "AES-256-CBC decryption or PKCS7 padding failed")
-}
+            .ok_or("Selected key entry has no encryption secret")?;
+        if nonce_and_ct.len() < 12 + 16 {
+            return Err("Invalid ChaCha20-Poly1305 ciphertext length");
+        }
+        let (nonce_bytes, ct) = nonce_and_ct.split_at(12);
+        let cipher = ChaCha20Poly1305::new(key.into());
+        let nonce = Nonce::from_slice(nonce_bytes);
+        cipher
+            .decrypt(nonce, Payload { msg: ct, aad })
+            .map_err(|_| "ChaCha20-Poly1305 AEAD authentication or decryption failed")
+    }
+
+    pub fn encrypt_aes256_cbc(&self, plaintext: &[u8]) -> Option<Vec<u8>> {
+        let mat = self.active_material()?;
+        let key = mat.encrypt_key.as_ref()?;
+        let mut iv = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut iv);
+        let ct = Aes256CbcEnc::new(key.into(), &iv.into())
+            .encrypt_padded_vec_mut::<Pkcs7>(plaintext);
+        let mut out = Vec::with_capacity(16 + ct.len());
+        out.extend_from_slice(&iv);
+        out.extend_from_slice(&ct);
+        Some(out)
+    }
+
+    pub fn decrypt_aes256_cbc(
+        &self,
+        iv_and_ct: &[u8],
+        key_id: Option<&str>,
+    ) -> Result<Vec<u8>, &'static str> {
+        let mat = self
+            .resolve_key(key_id)
+            .ok_or("Unknown or unconfigured encryption key ID")?;
+        let key = mat
+            .encrypt_key
+            .as_ref()
+            .ok_or("Selected key entry has no encryption secret")?;
+        if iv_and_ct.len() < 32 || (iv_and_ct.len() - 16) % 16 != 0 {
+            return Err("Invalid AES-256-CBC ciphertext length");
+        }
+        let (iv, ct) = iv_and_ct.split_at(16);
+        Aes256CbcDec::new(key.into(), iv.into())
+            .decrypt_padded_vec_mut::<Pkcs7>(ct)
+            .map_err(|_| "AES-256-CBC decryption or PKCS7 padding failed")
+    }
 }

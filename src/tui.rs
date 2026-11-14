@@ -73,7 +73,7 @@ async fn tui_event_loop(
                 )),
             ]))
             .block(Block::default().borders(Borders::ALL).title("Status"));
-            f.render_widget(header, chunks);
+            f.render_widget(header, chunks[0]);
 
             // 2. RTT Sparkline (scaled to microseconds for crisp integer bars)
             let spark_data: Vec<u64> = global
@@ -97,7 +97,7 @@ async fn tui_event_loop(
                 )
                 .data(&spark_data)
                 .style(Style::default().fg(Color::Green));
-            f.render_widget(sparkline, chunks);
+            f.render_widget(sparkline, chunks[1]);
 
             // 3. Per-Target Table (Directional Loss + One-Way Delay)
             let header_cells = [
@@ -173,12 +173,12 @@ async fn tui_event_loop(
                     .borders(Borders::ALL)
                     .title("Per-Target Directional Loss & One-Way Delay (OWD)"),
             );
-            f.render_widget(table, chunks);
+            f.render_widget(table, chunks[2]);
 
             // 4. Footer Help
             let footer = Paragraph::new("Press 'q' or Ctrl+C to exit TUI and print final summary.")
                 .style(Style::default().fg(Color::DarkGray));
-            f.render_widget(footer, chunks);
+            f.render_widget(footer, chunks[3]);
         })?;
 
         if event::poll(Duration::from_millis(200))? {
