@@ -230,17 +230,17 @@ impl SecurityConfig {
 
         match digest {
             AuthDigest::HmacMd5 => {
-                let mut mac = <Hmac<Md5>>::new_from_slice(key).expect("HMAC key init");
+                let mut mac = <Hmac<Md5> as Mac>::new_from_slice(key).expect("HMAC key init");
                 mac.update(data);
                 out.extend_from_slice(&mac.finalize().into_bytes());
             }
             AuthDigest::HmacSha256 => {
-                let mut mac = <Hmac<Sha256>>::new_from_slice(key).expect("HMAC key init");
+                let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC key init");
                 mac.update(data);
                 out.extend_from_slice(&mac.finalize().into_bytes());
             }
             AuthDigest::HmacSha512 => {
-                let mut mac = <Hmac<Sha512>>::new_from_slice(key).expect("HMAC key init");
+                let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(key).expect("HMAC key init");
                 mac.update(data);
                 out.extend_from_slice(&mac.finalize().into_bytes());
             }
@@ -265,17 +265,17 @@ impl SecurityConfig {
         let mut expected = vec![digest.digest_id()];
         match digest {
             AuthDigest::HmacMd5 => {
-                let mut mac = <Hmac<Md5>>::new_from_slice(key).expect("HMAC key init");
+                let mut mac = <Hmac<Md5> as Mac>::new_from_slice(key).expect("HMAC key init");
                 mac.update(data);
                 expected.extend_from_slice(&mac.finalize().into_bytes());
             }
             AuthDigest::HmacSha256 => {
-                let mut mac = <Hmac<Sha256>>::new_from_slice(key).expect("HMAC key init");
+                let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC key init");
                 mac.update(data);
                 expected.extend_from_slice(&mac.finalize().into_bytes());
             }
             AuthDigest::HmacSha512 => {
-                let mut mac = <Hmac<Sha512>>::new_from_slice(key).expect("HMAC key init");
+                let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(key).expect("HMAC key init");
                 mac.update(data);
                 expected.extend_from_slice(&mac.finalize().into_bytes());
             }

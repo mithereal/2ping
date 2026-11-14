@@ -152,7 +152,6 @@ impl Packet {
             opcode_data.extend_from_slice(&encrypted_blob);
         }
 
-        // Insert KEY_ID (0x0080) in ascending bit order (after HMAC 0x0040, before ENCRYPTED 0x8000)
         if include_key_id {
             flags |= opcodes::KEY_ID;
             let kid_bytes = sec.active_key_id.as_bytes();
@@ -167,7 +166,6 @@ impl Packet {
             opcode_data.splice(insert_pos..insert_pos, kid_tlv);
         }
 
-        // Insert HMAC (0x0040) before KEY_ID (0x0080) and ENCRYPTED (0x8000)
         let mut hmac_offset = None;
         let mut hmac_field_len = 0usize;
 
@@ -180,7 +178,6 @@ impl Packet {
                 hmac_tlv.extend_from_slice(&(hmac_field_len as u16).to_be_bytes());
                 hmac_tlv.resize(2 + hmac_field_len, 0x00);
 
-                // HMAC is always the lowest outer TLV bit among {0x0040, 0x0080, 0x8000}
                 let insert_pos = if (flags & (opcodes::KEY_ID | opcodes::ENCRYPTED)) != 0 {
                     0
                 } else {
@@ -194,7 +191,7 @@ impl Packet {
 
         let mut buf = Vec::with_capacity(self.min_size.max(MIN_HEADER_LEN + opcode_data.len()));
         buf.extend_from_slice(&MAGIC_NUMBER.to_be_bytes());
-        buf.extend_from_slice(&[0x00, 0x00]); // Checksum placeholder
+        buf.extend_from_slice(&[0x00, 0x00]);
         buf.extend_from_slice(&self.message_id);
         buf.extend_from_slice(&flags.to_be_bytes());
         buf.extend_from_slice(&opcode_data);

@@ -786,7 +786,7 @@ pub async fn run_engine(socket: UdpSocket, config: EngineConfig) -> std::io::Res
 
     if config.listen_mode {
         if let Some(handle) = tui_handle {
-            let _ = handle.await;
+            let _ = handle.is_finished();
         } else {
             tokio::signal::ctrl_c().await?;
         }
